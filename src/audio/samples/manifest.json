@@ -1,0 +1,4 @@
+[
+  { "id": "dog-sample", "name": "Dog", "file": "dog.wav" },
+  { "id": "cow-sample", "name": "Cow", "file": "cow.wav" }
+]

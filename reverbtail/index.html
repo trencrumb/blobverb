@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JavaScript Reverb Tail Generator</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>JavaScript Reverb Tail Generator</h1>
+        <p>
+            This script calculates RT60 using the Sabine formula and generates a corresponding
+            reverb tail using a <code>Float32Array</code>. Click the button to generate, play,
+            and visualize the audio.
+        </p>
+        <button id="generateButton">Generate & Play Reverb Tail</button>
+        <button id="DownloadButton">Download Impulse Response</button>
+        <div class="results">
+            <h2>Log</h2>
+            <pre id="logOutput">Ready...</pre>
+        </div>
+        <div class="visualizer">
+            <h2>Waveform</h2>
+            <canvas id="waveformCanvas"></canvas>
+        </div>
+    </div>
+    <script src="reverb.js"></script>
+</body>
+</html>

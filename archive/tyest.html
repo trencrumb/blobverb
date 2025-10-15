@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Amplitude Meter Utility</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding-top: 50px;
+        }
+        .control { margin: 10px; }
+        label { display: block; margin-bottom: 5px; color: #555; }
+        progress { width: 300px; height: 30px; }
+        #rms-value { font-family: monospace; font-size: 1.2em; font-weight: bold; }
+        #peak-value { font-family: monospace; font-size: 1.2em; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>Amplitude Meter Attached to a Gain Node</h1>
+    
+    <button id="startButton">Start/Stop Audio</button>
+    
+    <div class="control">
+        <label for="gainSlider">Gain (Volume)</label>
+        <input type="range" id="gainSlider" min="0" max="1" step="0.01" value="0.5">
+    </div>
+
+    <div class="control">
+        <label>RMS Amplitude</label>
+        <progress id="rms-progress" max="1" value="0"></progress>
+        <span id="rms-value">0.000</span>
+    </div>
+
+    <div class="control">
+        <label>Peak Amplitude</label>
+        <progress id="peak-progress" max="1" value="0"></progress>
+        <span id="peak-value">0.000</span>
+    </div>
+
+    <script src="createAmplitudeMeter.js"></script>
+
+    <script>
+        const startButton = document.getElementById('startButton');
+        const gainSlider = document.getElementById('gainSlider');
+        const rmsProgress = document.getElementById('rms-progress');
+        const rmsValue = document.getElementById('rms-value');
+        const peakProgress = document.getElementById('peak-progress');
+        const peakValue = document.getElementById('peak-value');
+
+        let audioContext;
+        let oscillator;
+        let whiteNoise;
+        let gainNode;
+        let meter;
+        let isPlaying = false;
+        let animationFrameId;
+
+        async function setupAudio() {
+            // Create AudioContext
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+            // Create white noise source
+            //await audioContext.audioWorklet.addModule('white-noise-processor.js');
+            //whiteNoise = new AudioWorkletNode(audioContext, 'white-noise-processor');
+
+            whiteNoiseBuffer = await createNoiseBuffer();
+            whiteNoise = audioContext.createBufferSource();
+            whiteNoise.buffer = whiteNoiseBuffer;
+            whiteNoise.loop = true;
+    
+
+            gainNode = audioContext.createGain();
+            gainNode.gain.setValueAtTime(gainSlider.value, audioContext.currentTime);
+
+            // *** Use the amplitude meter utility ***
+            // Attach the meter to the GainNode to measure its output level
+            meter = createAmplitudeMeter(audioContext, gainNode);
+
+            // Connect the main audio graph to be audible
+            whiteNoise.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+            whiteNoise.start();
+
+        }
+
+        async function createNoiseBuffer(){
+            const bufferSize = 2 * audioContext.sampleRate;
+            const noiseBuffer = audioContext.createBuffer(1, bufferSize, audioContext.sampleRate);
+            const output = noiseBuffer.getChannelData(0);
+            for (let i = 0; i < bufferSize; i++) {
+                output[i] = Math.random() * 2 - 1; // White noise
+            }
+            return noiseBuffer;
+        }
+
+        function stopAudio() {
+            if (meter) meter.stop(); // Clean up the meter
+            if (audioContext) audioContext.close();
+            
+            // Reset all state
+            audioContext = null;
+            gainNode = null;
+            meter = null;
+            isPlaying = false;
+        }
+
+        function updateUI() {
+            if (!meter) return;
+            
+            // Get the current RMS value from the meter
+            const rms = meter.getRMS();
+            
+            // Update the progress bar and text
+            rmsProgress.value = rms;
+            rmsValue.textContent = rms.toFixed(3);
+
+            // Get the current Peak value from the meter
+            const peak = meter.getPeak();
+            peakProgress.value = peak;
+            peakValue.textContent = peak.toFixed(3);
+
+            animationFrameId = requestAnimationFrame(updateUI);
+        }
+
+        startButton.addEventListener('click', () => {
+            if (!isPlaying) {
+                setupAudio();
+                isPlaying = true;
+                startButton.textContent = 'Stop Audio';
+                updateUI();
+            } else {
+                stopAudio();
+                cancelAnimationFrame(animationFrameId);
+                isPlaying = false;
+                startButton.textContent = 'Start Audio';
+                rmsProgress.value = 0; // Reset UI
+                rmsValue.textContent = '0.000';
+            }
+        });
+
+        gainSlider.addEventListener('input', (event) => {
+            if (gainNode) {
+                // Adjust the gain value in the audio graph
+                gainNode.gain.setTargetAtTime(event.target.value, audioContext.currentTime, 0.01);
+            }
+        });
+
+    </script>
+</body>
+</html>

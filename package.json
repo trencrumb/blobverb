@@ -1,0 +1,25 @@
+{
+  "name": "blob-verb",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "trencrumb",
+  "type": "module",
+  "main": "main.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@slangeder/rubberband-wasm": "^2.0.2",
+    "rubberband-wasm": "github:Daninet/rubberband-wasm",
+    "seedrandom": "^3.0.5",
+    "simplex-noise": "^4.0.3",
+    "three": "^0.180.0",
+    "three-mesh-bvh": "^0.9.1",
+    "wavesurfer.js": "^7.11.0",
+    "weq8": "^0.2.2"
+  },
+  "devDependencies": {
+    "vite": "^7.1.9"
+  }
+}
