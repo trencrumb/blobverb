@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { GUI } from 'three/examples/jsm/libs/lil-gui.module.min.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
-import { traceAcousticRays } from '../src/acoustic-raytracer.js';
+import { traceAcousticRays } from './acoustic-raytracer.js';
 import { 
     createFullBandImpulseResponse, 
     createMultiBandImpulseResponse,

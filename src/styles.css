@@ -19,9 +19,10 @@ canvas {
 .app-layout {
     flex: 1;
     display: grid;
-    grid-template-rows: 420px auto;
+    grid-template-rows: minmax(420px, 60vh) auto;
     gap: 16px;
     padding: 16px;
+    min-height: 0;
 }
 
 .top-row {
@@ -30,6 +31,7 @@ canvas {
     gap: 16px;
     min-height: 0;
     align-items: stretch;
+    height: 100%;
 }
 
 .panel {
@@ -98,6 +100,7 @@ canvas {
     background: #05060a;
     display: flex;
     position: relative;
+    height: 100%;
 }
 
 .scene-viewport canvas {
@@ -254,4 +257,28 @@ button:disabled {
     display: flex;
     gap: 8px;
     align-items: center;
+}
+
+@media (min-height: 900px) {
+    .app-layout {
+        grid-template-rows: minmax(500px, 65vh) auto;
+    }
+}
+
+@media (min-height: 1200px) {
+    .app-layout {
+        grid-template-rows: minmax(600px, 70vh) 1fr;
+    }
+    
+    .scene-viewport {
+        min-height: 500px;
+    }
+}
+
+/* For ultrawide monitors */
+@media (min-width: 2000px) {
+    .app-layout {
+        max-width: 2400px;
+        margin: 0 auto;
+    }
 }

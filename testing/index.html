@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Horizontal Peak Meter</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #282c34;
+            color: #fff;
+        }
+
+        .meter-wrapper {
+            width: 80%;
+            max-width: 600px;
+            margin-bottom: 2rem;
+        }
+
+        h3 {
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+            text-align: center;
+        }
+
+        /* The main container for the meter. We will control it with CSS Custom Properties. */
+        .peak-meter {
+            --level: 0;   /* Current level as a percentage (0-100) */
+            --peak: 0;    /* Peak level as a percentage (0-100) */
+            
+            position: relative;
+            height: 20px;
+            background-color: #1a1c20;
+            border-radius: 3px;
+            box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.5);
+            overflow: hidden;
+        }
+
+        /* The colored bar representing the current audio level */
+        .peak-meter-level {
+            position: absolute;
+            top: 0;
+            left: 0;
+            bottom: 0;
+            width: calc(1% * var(--level));
+            background: linear-gradient(to right, #4caf50, #ffeb3b 85%, #f44336 95%);
+            transition: width 0.05s linear; /* Smooths the fallback, but quick to react */
+        }
+
+        /* The thin line indicating the peak level */
+        .peak-meter-peak {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            left: calc(1% * var(--peak));
+            width: 2px;
+            background-color: #e57373;
+            transform: translateX(-50%); /* Center the line on the peak value */
+        }
+
+        /* The scale markings below the meter */
+        .peak-meter-scale {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 5px;
+            font-size: 10px;
+            color: #9e9e9e;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="meter-wrapper">
+        <h3>Master Output</h3>
+        <div class="peak-meter" id="master-meter">
+            <div class="peak-meter-level"></div>
+            <div class="peak-meter-peak"></div>
+        </div>
+        <div class="peak-meter-scale">
+            <span>-60</span>
+            <span>-30</span>
+            <span>-12</span>
+            <span>-6</span>
+            <span>0</span>
+            <span>+6</span>
+        </div>
+    </div>
+    
+    <script>
+        class PeakMeter {
+            /**
+             * @param {HTMLElement} element The container element for the meter.
+             * @param {object} options Configuration options.
+             * @param {number} [options.minDb=-60] The minimum decibel level.
+             * @param {number} [options.maxDb=6] The maximum decibel level.
+             * @param {number} [options.peakHoldTime=1500] Time in ms to hold the peak.
+             */
+            constructor(element, options = {}) {
+                this.element = element;
+                this.minDb = options.minDb ?? -60;
+                this.maxDb = options.maxDb ?? 6;
+                this.peakHoldTime = options.peakHoldTime ?? 1500;
+
+                this.currentDb = this.minDb;
+                this.peakDb = this.minDb;
+                this.peakTimeout = null;
+
+                if (!this.element) {
+                    throw new Error("Meter element not found.");
+                }
+            }
+
+            /**
+             * Converts a dB value to a percentage (0-100) based on the meter's range.
+             * @param {number} db The decibel value.
+             * @returns {number} The percentage value.
+             */
+            _dbToPercent(db) {
+                if (db <= this.minDb) return 0;
+                if (db >= this.maxDb) return 100;
+
+                const range = this.maxDb - this.minDb;
+                // This is a linear mapping of the logarithmic dB scale.
+                return ((db - this.minDb) / range) * 100;
+            }
+
+            /**
+             * Updates the meter with a new dB value.
+             * @param {number} db The new level in decibels.
+             */
+            update(db) {
+                this.currentDb = db;
+                
+                // Check if the new value is a new peak
+                if (db > this.peakDb) {
+                    this.peakDb = db;
+                    
+                    // Clear any existing timeout to reset the hold timer
+                    clearTimeout(this.peakTimeout);
+
+                    // Set a new timeout to make the peak fall back
+                    this.peakTimeout = setTimeout(() => {
+                        this.peakDb = this.currentDb;
+                        this._render();
+                    }, this.peakHoldTime);
+                }
+                
+                this._render();
+            }
+
+            /**
+             * Renders the current state to the DOM by updating CSS custom properties.
+             * @private
+             */
+            _render() {
+                const levelPercent = this._dbToPercent(this.currentDb);
+                const peakPercent = this._dbToPercent(this.peakDb);
+                
+                // Using CSS custom properties is highly efficient.
+                this.element.style.setProperty('--level', levelPercent.toFixed(2));
+                this.element.style.setProperty('--peak', peakPercent.toFixed(2));
+            }
+            
+            /**
+             * Resets the meter to its initial state.
+             */
+            reset() {
+                this.currentDb = this.minDb;
+                this.peakDb = this.minDb;
+                clearTimeout(this.peakTimeout);
+                this._render();
+            }
+        }
+
+
+        // --- DEMO ---
+        document.addEventListener('DOMContentLoaded', () => {
+            const meterElement = document.getElementById('master-meter');
+            
+            // Create a new meter instance
+            const myMeter = new PeakMeter(meterElement, {
+                minDb: -60,
+                maxDb: 6
+            });
+
+            // Simulate an audio signal to demonstrate the meter
+            function simulateSignal() {
+                // Generate a random value that tends to be lower but has occasional spikes
+                const random = Math.random();
+                const baseDb = -40;
+                const dynamicRange = 48; // -40dB to +8dB
+                
+                // Use a power function to make lower values more likely
+                let db = baseDb + (Math.pow(random, 3) * dynamicRange);
+
+                // Occasionally create a loud peak to test the peak-hold
+                if (Math.random() < 0.05) {
+                    db = 2 + Math.random() * 4; // A peak between +2 and +6 dB
+                }
+                
+                // Update the meter with the new value
+                myMeter.update(db);
+            }
+
+            // Run the simulation every 100ms
+            setInterval(simulateSignal, 100);
+        });
+    </script>
+</body>
+</html>

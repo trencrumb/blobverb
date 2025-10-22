@@ -9,6 +9,7 @@ import {
     acceleratedRaycast, 
     MeshBVH 
 } from 'three-mesh-bvh/build/index.module.js';
+import seedrandom from 'seedrandom';
 
 // Add BVH methods to geometry prototypes
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
@@ -48,8 +49,6 @@ function initWorker() {
     }
 }
 
-// Update the createRoomMesh function around line 45
-
 function createRoomMesh(geometryData) {
     try {
         // Create geometry from transferred data
@@ -68,6 +67,8 @@ function createRoomMesh(geometryData) {
         
         // Build BVH for ultra-fast raycasting
         geometry.computeBoundsTree();
+        geometry.computeBoundingBox();
+        geometry.computeBoundingSphere();
         
         console.log('Full BVH built successfully:');
         console.log(`- Triangle count: ${geometry.index ? geometry.index.count / 3 : positions.length / 9}`);
@@ -75,19 +76,29 @@ function createRoomMesh(geometryData) {
         console.log(`- Geometry bounds:`, geometry.boundingBox);
         console.log(`- BVH bounds:`, geometry.boundsTree.getBoundingBox(new THREE.Box3()));
         
-        // Create mesh
-        const material = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
+        // Create mesh with proper material
+        const material = new THREE.MeshBasicMaterial({ 
+            side: THREE.DoubleSide,
+            visible: true
+        });
         roomMesh = new THREE.Mesh(geometry, material);
         
-        // Ensure the mesh is visible and positioned correctly
-        roomMesh.visible = true;
+        // CRITICAL: Initialize all matrix properties
         roomMesh.position.set(0, 0, 0);
+        roomMesh.rotation.set(0, 0, 0);
+        roomMesh.scale.set(1, 1, 1);
+        roomMesh.matrixAutoUpdate = false;
+        roomMesh.updateMatrix();
         roomMesh.updateMatrixWorld(true);
+        roomMesh.visible = true;
+        
+        // Set layers (this was the missing property!)
+        roomMesh.layers.enableAll();
         
         console.log('Room mesh created:');
         console.log(`- Position:`, roomMesh.position);
         console.log(`- Visible:`, roomMesh.visible);
-        console.log(`- Matrix world updated:`, roomMesh.matrixWorldNeedsUpdate);
+        console.log(`- Has layers:`, !!roomMesh.layers);
         
         return roomMesh;
     } catch (error) {
@@ -96,20 +107,32 @@ function createRoomMesh(geometryData) {
     }
 }
 
-// Create emitter mesh with BVH acceleration
+
 function createEmitterMesh(radius, position) {
     try {
         const geometry = new THREE.SphereGeometry(radius, 16, 16);
-        // Even the sphere gets BVH acceleration
         geometry.computeBoundsTree();
+        geometry.computeBoundingBox();
+        geometry.computeBoundingSphere();
         
-        const material = new THREE.MeshBasicMaterial();
+        const material = new THREE.MeshBasicMaterial({ visible: true });
         emitterMesh = new THREE.Mesh(geometry, material);
+        
+        // CRITICAL: Initialize all matrix properties
         emitterMesh.position.set(position.x, position.y, position.z);
+        emitterMesh.rotation.set(0, 0, 0);
+        emitterMesh.scale.set(1, 1, 1);
+        emitterMesh.matrixAutoUpdate = false;
+        emitterMesh.updateMatrix();
+        emitterMesh.updateMatrixWorld(true);
+        emitterMesh.visible = true;
+        
+        // Set layers
+        emitterMesh.layers.enableAll();
         
         console.log(`Worker: Emitter sphere created with ${geometry.attributes.position.count} vertices`);
         console.log(`Worker: Emitter BVH bounds:`, geometry.boundsTree.getBoundingBox(new THREE.Box3()));
-        console.log(`Worker: Emitter world bounds after positioning:`, emitterMesh.geometry.boundingBox);
+        console.log(`Worker: Emitter has layers:`, !!emitterMesh.layers);
         
         return emitterMesh;
     } catch (error) {
@@ -122,187 +145,174 @@ function createEmitterMesh(radius, position) {
 function runSimulation(params) {
     const {
         numRays,
-        maxBounces = 200,
+        maxBounces,
         wallAbsorption,
-        diffuseThreshold,
-        randomizePhase,
+        useFreqDependent = true,
+        absorptionCoeffs = {},
         seed,
-        speedOfSound = 343,
-        batchSize = 2000 // Large batches for worker efficiency
+        speedOfSound,
+        batchSize = 5000
     } = params;
-    
-    // Set seed using Math.random with a simple seeding function
-    if (seed) {
-        // Simple deterministic seeding for reproducible results
-        let seedValue = 0;
-        for (let i = 0; i < seed.length; i++) {
-            seedValue = (seedValue * 31 + seed.charCodeAt(i)) % 2147483647;
-        }
-        
-        // Simple linear congruential generator
-        let currentSeed = seedValue;
-        Math.random = function() {
-            currentSeed = (currentSeed * 16807) % 2147483647;
-            return (currentSeed - 1) / 2147483646;
-        };
-    }
-    
-    const reflectionCoefficient = 1.0 - wallAbsorption;
-    const arrivals = [];
-    let processedRays = 0;
-    
-    console.log(`Starting high-performance BVH simulation: ${numRays} rays`);
-    const startTime = performance.now();
-    
-    // Process rays in batches
-    function processBatch() {
-        const endRay = Math.min(processedRays + batchSize, numRays);
-        const batchStartTime = performance.now();
-        
-        for (let i = processedRays; i < endRay; i++) {
-            // Reset ray starting position and direction using Three.js vectors
-            _rayOrigin.set(0, 0, 0);
-            _rayDirection.randomDirection();
 
-            /*
-            // Debug: log first few rays
-            if (i < 3) {
-                console.log(`Ray ${i}: Origin (${_rayOrigin.x}, ${_rayOrigin.y}, ${_rayOrigin.z}), Direction (${_rayDirection.x.toFixed(3)}, ${_rayDirection.y.toFixed(3)}, ${_rayDirection.z.toFixed(3)})`);
-            }
-            */
+    const restoreRandom = Math.random;
+    if (seed) {
+        seedrandom(seed, { global: true });
+    }
+
+    // remove unused broadband reflectionCoefficient
+    // const reflectionCoefficient = 1.0 - wallAbsorption;
+    
+    // Setup for multi-band simulation
+    const freqBands = useFreqDependent ? Object.keys(absorptionCoeffs).map(Number).sort((a, b) => a - b) : null;
+    const arrivalsByBand = useFreqDependent ? {} : null;
+    const arrivals = [];
+    
+    if (useFreqDependent) {
+        freqBands.forEach(freq => {
+            arrivalsByBand[freq] = [];
+        });
+    }
+
+    let processedRays = 0;
+    const startTime = performance.now();
+
+    const origin = new THREE.Vector3();
+    const direction = new THREE.Vector3();
+    const ray = new THREE.Raycaster();
+    ray.firstHitOnly = true;
+
+    const roomIntersects = [];
+    const receiverIntersects = [];
+
+    function processBatch() {
+        const batchStartIndex = processedRays;
+        const endRay = Math.min(processedRays + batchSize, numRays);
+        const batchStart = performance.now();
+
+        for (let i = processedRays; i < endRay; i++) {
+            origin.set(0, 0, 0);
+            direction.set(
+                Math.random() * 2 - 1,
+                Math.random() * 2 - 1,
+                Math.random() * 2 - 1
+            ).normalize();
 
             let totalDistance = 0;
-            let amplitude = 1.0;
             let bounceCount = 0;
-            
-            // Trace ray through scene using full BVH acceleration
-            for (let j = 0; j < maxBounces; j++) {
-                raycaster.set(_rayOrigin, _rayDirection);
 
-                // Use accelerated raycast with BVH - this is where the speed comes from!
-                const roomIntersects = raycaster.intersectObject(roomMesh);
-                const receiverIntersects = raycaster.intersectObject(emitterMesh);
-                /*
-                // Debug: log intersection results for first few rays
-                if (i < 3) {
-                    console.log(`Ray ${i}, Bounce ${j}: Room hits: ${roomIntersects.length}, Receiver hits: ${receiverIntersects.length}`);
-                    if (roomIntersects.length > 0) {
-                        console.log(`  Room hit distance: ${roomIntersects[0].distance}, point:`, roomIntersects[0].point);
-                    }
-                    if (receiverIntersects.length > 0) {
-                        console.log(`  Receiver hit distance: ${receiverIntersects[0].distance}, point:`, receiverIntersects[0].point);
-                    }
+            // Track amplitude per frequency band
+            const amplitudes = useFreqDependent 
+                ? Object.fromEntries(freqBands.map(f => [f, 1.0]))
+                : { broadband: 1.0 };
 
-                    // Debug the room mesh properties
-                    if (j === 0) {
-                        console.log(`Ray ${i}: Room mesh has ${roomMesh.geometry.attributes.position.count} vertices`);
-                        console.log(`Ray ${i}: Room mesh BVH bounds:`, roomMesh.geometry.boundsTree?.getBoundingBox(new THREE.Box3()));
-                        console.log(`Ray ${i}: Raycaster ray:`, raycaster.ray);
-                    }
-                }
-                */
+            for (let b = 0; b < maxBounces; b++) {
+                ray.set(origin, direction);
 
-                // Check if ray hits receiver first
-                if (receiverIntersects.length > 0 && 
-                    (roomIntersects.length === 0 || receiverIntersects[0].distance < roomIntersects[0].distance)) {
-                    /*
-                    // Debug: log receiver hits for first few rays
-                    if (i < 5) {
-                        console.log(`Ray ${i}: Receiver hit at distance ${receiverIntersects[0].distance}`);
-                    }
-                    */
+                roomIntersects.length = 0;
+                receiverIntersects.length = 0;
 
-                    // Only count if not too close (avoid direct hits)
-                    if (receiverIntersects[0].distance > 0.001) {
+                ray.intersectObject(emitterMesh, false, receiverIntersects);
+                ray.intersectObject(roomMesh, false, roomIntersects);
+
+                const receiverHit = receiverIntersects.length > 0;
+                const roomHit = roomIntersects.length > 0;
+
+                if (
+                    receiverHit &&
+                    (
+                        !roomHit ||
+                        (roomIntersects[0] && receiverIntersects[0] && receiverIntersects[0].distance < roomIntersects[0].distance)
+                    )
+                ) {
+                    if (receiverIntersects[0] && receiverIntersects[0].distance > 0.001) {
                         totalDistance += receiverIntersects[0].distance;
+                        const arrivalTime = totalDistance / speedOfSound;
 
-                        let finalAmplitude = amplitude;
-                        if (randomizePhase && bounceCount > diffuseThreshold) {
-                            finalAmplitude *= (Math.random() < 0.5 ? 1 : -1);
+                        if (useFreqDependent) {
+                            freqBands.forEach(freq => {
+                                let finalAmp = amplitudes[freq];
+                                arrivalsByBand[freq].push({ time: arrivalTime, amplitude: finalAmp });
+                            });
+                        } else {
+                            let finalAmp = amplitudes.broadband;
+                            arrivals.push({ time: arrivalTime, amplitude: finalAmp });
                         }
-
-                        arrivals.push({
-                            time: totalDistance / speedOfSound,
-                            amplitude: finalAmplitude
-                        });
                         break;
-                    } else if (i < 5) {
-                        console.log(`Ray ${i}: Receiver hit too close (${receiverIntersects[0].distance}), skipping`);
                     }
                 }
 
-                // Handle room collision with BVH acceleration
-                if (roomIntersects.length > 0) {
+                if (roomHit && roomIntersects[0]) {
                     const intersection = roomIntersects[0];
                     bounceCount++;
                     totalDistance += intersection.distance;
-                    amplitude *= reflectionCoefficient;
 
-                    // Update ray position and direction using Three.js methods
-                    _rayOrigin.copy(intersection.point);
-                    _rayDirection.reflect(intersection.face.normal);
-
-                    // Move slightly away from surface
-                    _tempVec.copy(_rayDirection).multiplyScalar(0.001);
-                    _rayOrigin.add(_tempVec);
-
-                    if (i < 3) {
-                        console.log(`Ray ${i}: Hit room at distance ${intersection.distance}, bouncing to:`, _rayOrigin);
+                    // Apply frequency-dependent absorption (no wallAbsorption fallback)
+                    if (useFreqDependent) {
+                        freqBands.forEach(freq => {
+                            const absorption = absorptionCoeffs[freq] ?? 0;
+                            amplitudes[freq] *= (1.0 - absorption);
+                        });
+                    } else {
+                        amplitudes.broadband *= (1.0 - (wallAbsorption ?? 0));
                     }
+
+                    origin.copy(intersection.point);
+                    direction.reflect(intersection.face.normal);
+                    origin.addScaledVector(direction, 0.001);
                 } else {
-                    // Ray escaped without hitting anything
-                    if (i < 3) {
-                        console.log(`Ray ${i}: No room intersections found, ray escaped`);
-                        console.log(`Ray ${i}: Ray origin:`, _rayOrigin, "Direction:", _rayDirection);
-                        console.log(`Ray ${i}: Room mesh exists:`, !!roomMesh);
-                        console.log(`Ray ${i}: Room mesh visible:`, roomMesh?.visible);
-                        console.log(`Ray ${i}: Room geometry exists:`, !!roomMesh?.geometry);
-                        console.log(`Ray ${i}: Room BVH exists:`, !!roomMesh?.geometry?.boundsTree);
-                    }
                     break;
                 }
             }
         }
-        
+
+        const processedThisBatch = endRay - batchStartIndex;
         processedRays = endRay;
-        const batchTime = performance.now() - batchStartTime;
-        const raysPerSecond = Math.round((endRay - (endRay - batchSize)) / (batchTime / 1000));
-        
-        // Send progress update with performance metrics
+        const progress = processedRays / numRays;
+        const batchTime = performance.now() - batchStart;
+        const raysPerSecond = processedThisBatch > 0 && batchTime > 0 ? Math.round(processedThisBatch / (batchTime / 1000)) : 0;
+
+        // report total arrivals (sum across bands) for progress
+        const currentArrivals = useFreqDependent
+            ? Object.values(arrivalsByBand).reduce((s, a) => s + a.length, 0)
+            : arrivals.length;
+
         self.postMessage({
             type: 'progress',
-            progress: processedRays / numRays,
-            processedRays: processedRays,
-            totalRays: numRays,
+            progress: progress,
             raysPerSecond: raysPerSecond,
-            currentArrivals: arrivals.length
+            currentArrivals: currentArrivals
         });
-        
-        // Continue processing or finish
+
         if (processedRays < numRays) {
-            // Schedule next batch (non-blocking)
             setTimeout(processBatch, 0);
         } else {
-            // Send final results
-            const totalTime = performance.now() - startTime;
-            const avgRaysPerSecond = Math.round(numRays / (totalTime / 1000));
-            
-            console.log(`BVH Worker simulation complete: ${arrivals.length} arrivals in ${totalTime.toFixed(0)}ms`);
-            console.log(`Average performance: ${avgRaysPerSecond} rays/second`);
-            
-            self.postMessage({
-                type: 'complete',
-                arrivals: arrivals,
-                totalArrivals: arrivals.length,
-                totalTime: totalTime,
-                avgRaysPerSecond: avgRaysPerSecond
-            });
+            Math.random = restoreRandom;
+
+            const elapsedTime = performance.now() - startTime;
+            const avgRaysPerSecond = elapsedTime > 0 ? Math.round(numRays / (elapsedTime / 1000)) : 0;
+
+            if (useFreqDependent) {
+                const totalArrivals = Object.values(arrivalsByBand).reduce((s, a) => s + a.length, 0);
+                self.postMessage({
+                    type: 'complete',
+                    arrivalsByBand: arrivalsByBand,
+                    freqBands: freqBands,
+                    totalArrivals: totalArrivals,
+                    avgRaysPerSecond: avgRaysPerSecond
+                });
+            } else {
+                self.postMessage({
+                    type: 'complete',
+                    arrivals: arrivals,
+                    totalArrivals: arrivals.length,
+                    avgRaysPerSecond: avgRaysPerSecond
+                });
+            }
         }
     }
-    
-    // Start processing
+
     processBatch();
-}
+};
 
 // Handle messages from main thread
 self.onmessage = function(e) {

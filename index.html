@@ -63,7 +63,7 @@
                             <div class="control-group">
                                 <label for="randomSeed">Simulation Seed</label>
                                 <div class="flex-row">
-                                    <input type="text" id="randomSeed" value="big-ben-chimes">
+                                    <input type="text" id="randomSeed" value="nmz6kp.6n">
                                     <button id="randomizeSeedBtn" title="Generate Random Seed">🎲</button>
                                 </div>
                             </div>
@@ -94,21 +94,34 @@
                         <fieldset>
                             <legend>Acoustic Properties</legend>
                             <div class="control-group">
-                                <label for="diffuseThreshold">Diffuse after N bounces</label>
-                                <input type="number" id="diffuseThreshold" value="4" min="0" step="1">
-                            </div>
-                            <div class="control-group checkbox-with-label">
-                                <input type="checkbox" id="phaseToggle" checked>
-                                <label for="phaseToggle">Randomize Phase</label>
-                            </div>
-                            <div class="control-group">
                                 <label for="numRays">Number of Rays <span id="numRays-val">15000</span></label>
                                 <input type="range" id="numRays" min="1" max="30000" step="10" value="15000">
                             </div>
-                            <div class="control-group">
-                                <label for="wallAbsorption">Wall Absorption <span id="wallAbsorption-val">0.08</span></label>
-                                <input type="range" id="wallAbsorption" min="0.01" max="1.0" step="0.01" value="0.08">
+                            <div id="freq-absorption-controls" class="control-group" style="display: none;">
+                                <label>200 Hz: <span id="absorption200-val">0.15</span><input type="range" id="absorption200" min="0.01" max="1" step="0.01" value="0.15" /></label>
+                                <label>800 Hz: <span id="absorption800-val">0.2</span><input type="range" id="absorption800" min="0.01" max="1" step="0.01" value="0.2" /></label>
+                                <label>3200 Hz: <span id="absorption3200-val">0.25</span><input type="range" id="absorption3200" min="0.01" max="1" step="0.01" value="0.25" /></label>
+                                <label>10000 Hz: <span id="absorption10000-val">0.3</span><input type="range" id="absorption10000" min="0.01" max="1" step="0.01" value="0.3" /></label>
                             </div>
+                            <div class="control-group">
+                                <label>
+                                    <input type="checkbox" id="useWebWorker" checked />
+                                    Use Web Worker
+                                </label>
+                            </div>
+                            <div class="control-group">
+                                <label>
+                                    <input type="checkbox" id="realtimeSimToggle" checked/>
+                                    Realtime Preview (1500 rays)
+                                </label>
+                            </div>
+
+                            <script>
+                            // Show/hide frequency controls based on checkbox
+                            document.getElementById('useFreqDependent')?.addEventListener('change', (e) => {
+                                document.getElementById('freq-absorption-controls').style.display = e.target.checked ? 'block' : 'none';
+                            });
+                            </script>
                         </fieldset>
 
                         <button id="startButton" class="cta">Simulate Acoustics</button>
@@ -135,6 +148,17 @@
                                     <option value="vocal">Vocal Phrase</option>
                                 </select>
                                 <button id="playSampleBtn" type="button">Play</button>
+                            </div>
+                            <div class="control-group">
+                                <span>Dry Level</span>
+                                <output for="dry-slider" id="dry-output">0.0 dB</output>
+                                <input type="range" id="dry-slider" min="0" max="1000" step="1">
+                            </div>
+
+                            <div class="control-group">
+                                <span>Wet Level</span>
+                                <output for="wet-slider" id="wet-output">0.0 dB</output>
+                                <input type="range" id="wet-slider" min="0" max="1000" step="1">
                             </div>
                         </fieldset>
                     </div>

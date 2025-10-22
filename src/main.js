@@ -9,6 +9,7 @@ import TimelinePlugin from 'wavesurfer.js/dist/plugins/timeline.esm.js';
 
 import { createAmplitudeMeter } from './amplitude-meter.js';
 import { EnvelopeFollower } from './envelope-follower.js';
+import { initLogSlider } from './log-slider.js';
 
 import { createNoise3D } from 'simplex-noise';
 import seedrandom from 'seedrandom';
@@ -19,191 +20,200 @@ import noise3DGLSL from './shaders/noise3D.glsl?raw';
 import vertexSrc from './shaders/vertex.glsl?raw';
 import fragmentSrc from './shaders/fragment.glsl?raw';
 
-
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
-const app = {
-    config: {
-        CANVAS_TARGET_ID: 'threeViewport',
-        INITIAL_CAMERA_DISTANCE: 35,
-        DEFAULT_MAX_BOUNCES: 100,
-        SPEED_OF_SOUND: 343,
-        EMITTER_RADIUS: 0.5
-    },
-    dom: {},
-    three: {
-        raycaster: new THREE.Raycaster(),
-        vectors: {
-            origin: new THREE.Vector3(),
-            direction: new THREE.Vector3(),
-            temp: new THREE.Vector3()
-        },
-        container: null,
-        scene: null,
-        camera: null,
-        renderer: null,
-        controls: null,
-        stats: null,
-        emitterMesh: null,
-        rayLinesGroup: null
-    },
-    audio: {
-        context: null,
-        convolver: null,
-        masterGain: null,
-        amplitudeMeter: null,
-        rmsEnvelope: null,
-        peakEnvelope: null,
-        impulseResponseBuffer: null,
-        impulseResponseSource: null,
-        wavesurfer: null
-    },
-    state: {
-        initialized: false,
-        isSimulating: false,
-        shaderMaterial: null,
-        roomMesh: null,
-        baseVertexDirections: null,
-        noise3D: createNoise3D(),
-        sampleBuffer: null,
-        sampleSourceNode: null,
-        maxBounces: 100
-    },
-    worker: {
-        instance: null
-    }
+// -----------------------------------------------------------------------------
+// Config & mutable state
+// -----------------------------------------------------------------------------
+const CONFIG = {
+    CANVAS_TARGET_ID: 'threeViewport',
+    INITIAL_CAMERA_DISTANCE: 35,
+    DEFAULT_MAX_BOUNCES: 100,
+    SPEED_OF_SOUND: 343,
+    EMITTER_RADIUS: 0.5,
+    FREQ_BANDS: [
+        200,    // Low
+        800,    // Mid
+        3200,   // High
+        10000   // Ultra High
+    ]
 };
 
-app.state.maxBounces = app.config.DEFAULT_MAX_BOUNCES;
-app.three.raycaster.firstHitOnly = true;
-
-const selectors = {
-    baseRadius: '#baseRadius',
-    noiseFrequency: '#noiseFreq',
-    noiseAmplitude: '#noiseAmp',
-    randomSeed: '#randomSeed',
-    status: '#status',
-    startButton: '#startButton'
+const dom = {};
+const state = {
+    initialized: false,
+    isSimulating: false,
+    shaderMaterial: null,
+    roomMesh: null,
+    baseVertexDirections: null,
+    noise3D: createNoise3D(),
+    maxBounces: CONFIG.DEFAULT_MAX_BOUNCES,
+    workerGeometryReady: false,
+    realtimeSimEnabled: true
 };
 
-app.dom = Object.fromEntries(
-    Object.entries(selectors).map(([key, selector]) => [key, document.querySelector(selector)])
-);
+// Three.js references
+let container;
+let scene;
+let camera;
+let renderer;
+let controls;
+let stats;
+let emitterMesh;
+let rayLinesGroup;
+const raycaster = new THREE.Raycaster();
+const vectors = {
+    origin: new THREE.Vector3(),
+    direction: new THREE.Vector3(),
+    temp: new THREE.Vector3()
+};
+raycaster.firstHitOnly = true;
 
-app.dom.status = app.dom.status || document.getElementById('status');
-app.dom.downloadBtn = document.getElementById('downloadBtn');
-app.dom.randomizeSeedBtn = document.getElementById('randomizeSeedBtn');
-app.dom.phaseToggle = document.getElementById('phaseToggle');
-app.dom.raysToVisualizeSlider = document.getElementById('raysToVisualize');
-app.dom.lineColorModeSelect = document.getElementById('lineColorMode');
-app.dom.sampleAudioSelect = document.getElementById('sample-audio');
-app.dom.playSampleBtn = document.getElementById('playSampleBtn');
-app.dom.stopSampleBtn = document.getElementById('stopSampleBtn');
+// Audio references
+let audioContext;
+let convolver;
+let dryGain;
+let wetGain;
+let masterGain;
+let drySliderCtrl;
+let wetSliderCtrl;
+let amplitudeMeter;
+let rmsEnvelope;
+let peakEnvelope;
+let impulseResponseBuffer;
+let impulseResponseSource;
+let sampleBuffer;
+let sampleSourceNode;
+let wavesurfer;
+let weq8Runtime;
 
-if (app.dom.downloadBtn) {
-    app.dom.downloadBtn.disabled = true;
+// Worker reference
+let workerInstance = null;
+
+// -----------------------------------------------------------------------------
+// DOM helpers
+// -----------------------------------------------------------------------------
+function cacheDom() {
+    Object.assign(dom, {
+        baseRadius: document.getElementById('baseRadius'),
+        noiseFrequency: document.getElementById('noiseFreq'),
+        noiseAmplitude: document.getElementById('noiseAmp'),
+        randomSeed: document.getElementById('randomSeed'),
+        status: document.getElementById('status'),
+        startButton: document.getElementById('startButton'),
+        downloadBtn: document.getElementById('downloadBtn'),
+        randomizeSeedBtn: document.getElementById('randomizeSeedBtn'),
+        raysToVisualizeSlider: document.getElementById('raysToVisualize'),
+        lineColorModeSelect: document.getElementById('lineColorMode'),
+        sampleAudioSelect: document.getElementById('sample-audio'),
+        playSampleBtn: document.getElementById('playSampleBtn'),
+        stopSampleBtn: document.getElementById('stopSampleBtn'),
+        drySlider: document.getElementById('dry-slider'),
+        dryOutput: document.getElementById('dry-output'),
+        wetSlider: document.getElementById('wet-slider'),
+        wetOutput: document.getElementById('wet-output'),
+        useWebWorker: document.getElementById('useWebWorker'), 
+        realtimeSimToggle: document.getElementById('realtimeSimToggle') 
+    });
+
+    if (dom.downloadBtn) dom.downloadBtn.disabled = true;
 }
 
 function setStatus(message) {
-    if (app.dom.status) {
-        app.dom.status.textContent = message;
+    if (dom.status) dom.status.textContent = message;
+}
+
+// -----------------------------------------------------------------------------
+// Three.js setup
+// -----------------------------------------------------------------------------
+function setupScene() {
+    container = document.getElementById(CONFIG.CANVAS_TARGET_ID);
+
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1000);
+    camera.position.set(0, 0, CONFIG.INITIAL_CAMERA_DISTANCE);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+    if (container) {
+        container.appendChild(renderer.domElement);
+        renderer.domElement.style.display = 'block';
+        renderer.domElement.style.width = '100%';
+        renderer.domElement.style.height = '100%';
+    } else {
+        console.warn('Three.js viewport container not found; falling back to document.body');
+        document.body.appendChild(renderer.domElement);
+        renderer.setSize(window.innerWidth, window.innerHeight);
     }
-}
 
-function getInputElement(id) {
-    return document.getElementById(id);
-}
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
 
-function getNumericInputValue(id, fallback = 0) {
-    const element = getInputElement(id);
-    if (!element) return fallback;
-    const value = parseFloat(element.value);
-    return Number.isFinite(value) ? value : fallback;
-}
+    scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+    scene.add(new THREE.PointLight(0xffffff, 1.5));
 
-function getIntegerInputValue(id, fallback = 0) {
-    const element = getInputElement(id);
-    if (!element) return fallback;
-    const value = parseInt(element.value, 10);
-    return Number.isFinite(value) ? value : fallback;
-}
+    stats = new Stats();
+    stats.dom.style.position = 'absolute';
+    stats.dom.style.top = '8px';
+    stats.dom.style.left = '8px';
+    stats.dom.style.pointerEvents = 'none';
+    stats.dom.style.zIndex = '2';
+    if (container) {
+        stats.dom.style.position = 'absolute';
+        container.appendChild(stats.dom);
+    } else {
+        stats.dom.style.position = 'fixed';
+        document.body.appendChild(stats.dom);
+    }
 
-app.three.container = document.getElementById(app.config.CANVAS_TARGET_ID);
-app.three.scene = new THREE.Scene();
-app.three.camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-app.three.camera.position.set(0, 0, app.config.INITIAL_CAMERA_DISTANCE);
+    emitterMesh = new THREE.Mesh(
+        new THREE.SphereGeometry(CONFIG.EMITTER_RADIUS, 32, 32),
+        new THREE.MeshStandardMaterial({ color: 0xffd700, emissive: 0xffd700, emissiveIntensity: 0.5 })
+    );
+    scene.add(emitterMesh);
 
-app.three.renderer = new THREE.WebGLRenderer({ antialias: true });
-app.three.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-if (app.three.container) {
-    app.three.container.appendChild(app.three.renderer.domElement);
-    app.three.renderer.domElement.style.display = 'block';
-    app.three.renderer.domElement.style.width = '100%';
-    app.three.renderer.domElement.style.height = '100%';
-} else {
-    console.warn('Three.js viewport container not found; falling back to document.body');
-    document.body.appendChild(app.three.renderer.domElement);
-    app.three.renderer.setSize(window.innerWidth, window.innerHeight);
+    rayLinesGroup = new THREE.Group();
+    scene.add(rayLinesGroup);
+
+    updateRendererSize(true);
+    window.addEventListener('resize', () => updateRendererSize(true));
 }
 
 function updateRendererSize(force = false) {
-    const width = app.three.container ? app.three.container.clientWidth : window.innerWidth;
-    const height = app.three.container ? app.three.container.clientHeight : window.innerHeight;
+    const width = container ? container.clientWidth : window.innerWidth;
+    const height = container ? container.clientHeight : window.innerHeight;
     if (width === 0 || height === 0) return;
+
     const pixelRatio = Math.min(window.devicePixelRatio, 2);
-    const canvas = app.three.renderer.domElement;
-    const needResize = force || canvas.width !== Math.floor(width * pixelRatio) || canvas.height !== Math.floor(height * pixelRatio);
+    const canvas = renderer.domElement;
+    const needResize =
+        force ||
+        canvas.width !== Math.floor(width * pixelRatio) ||
+        canvas.height !== Math.floor(height * pixelRatio);
+
     if (needResize) {
-        app.three.renderer.setPixelRatio(pixelRatio);
-        app.three.renderer.setSize(width, height);
-        app.three.camera.aspect = width / height;
-        app.three.camera.updateProjectionMatrix();
+        renderer.setPixelRatio(pixelRatio);
+        renderer.setSize(width, height);
+        camera.aspect = width / height;
+        camera.updateProjectionMatrix();
     }
 }
 
-updateRendererSize(true);
-window.addEventListener('resize', () => updateRendererSize(true));
-
-app.three.controls = new OrbitControls(app.three.camera, app.three.renderer.domElement);
-
-app.three.scene.add(new THREE.AmbientLight(0xffffff, 0.4));
-app.three.scene.add(new THREE.PointLight(0xffffff, 1.5));
-
-app.three.stats = new Stats();
-app.three.stats.dom.style.position = 'absolute';
-app.three.stats.dom.style.top = '8px';
-app.three.stats.dom.style.left = '8px';
-app.three.stats.dom.style.pointerEvents = 'none';
-app.three.stats.dom.style.zIndex = '2';
-if (app.three.container) {
-    app.three.container.appendChild(app.three.stats.dom);
-} else {
-    app.three.stats.dom.style.position = 'fixed';
-    document.body.appendChild(app.three.stats.dom);
-}
-
-/**
- * Shader
- */
+// -----------------------------------------------------------------------------
+// Shader + geometry
+// -----------------------------------------------------------------------------
 function injectAmplifierUniforms(material) {
     if (!material?.uniforms) return;
-    const frequencyInput = app.dom.noiseFrequency;
-    const amplitudeInput = app.dom.noiseAmplitude;
-    if (frequencyInput) {
-        material.uniforms.uFrequency.value = parseFloat(frequencyInput.value);
-    }
-    if (amplitudeInput) {
-        material.uniforms.uAmplitude.value = parseFloat(amplitudeInput.value);
-    }
+    if (dom.noiseFrequency) material.uniforms.uFrequency.value = parseFloat(dom.noiseFrequency.value);
+    if (dom.noiseAmplitude) material.uniforms.uAmplitude.value = parseFloat(dom.noiseAmplitude.value);
     material.needsUpdate = true;
 }
 
 async function createShaderMaterial() {
-    console.log('Loading shaders...');
     const finalVertexShader = vertexSrc.replace('${glsl_noise_3d}', noise3DGLSL);
-
     const material = new THREE.ShaderMaterial({
         uniforms: {
             uTime: { value: 0.0 },
@@ -219,66 +229,49 @@ async function createShaderMaterial() {
         depthWrite: false
     });
 
-    injectAmplifierUniforms(material);
-    console.log('Shader material created successfully');
     return material;
 }
 
 async function initShader() {
-    app.state.shaderMaterial = await createShaderMaterial();
+    console.log('Loading shaders...');
+    state.shaderMaterial = await createShaderMaterial();
+    console.log('Shader material created successfully');
 }
-
-/**
- * Geometry
- */
-app.three.emitterMesh = new THREE.Mesh(
-    new THREE.SphereGeometry(app.config.EMITTER_RADIUS, 32, 32),
-    new THREE.MeshStandardMaterial({ color: 0xffd700, emissive: 0xffd700, emissiveIntensity: 0.5 })
-);
-app.three.scene.add(app.three.emitterMesh);
-
-app.three.rayLinesGroup = new THREE.Group();
-app.three.scene.add(app.three.rayLinesGroup);
 
 function applySeed(seed) {
     const rng = seedrandom(seed || undefined);
-    app.state.noise3D = createNoise3D(rng);
+    state.noise3D = createNoise3D(rng);
 }
 
 function buildRoomGeometry() {
-    if (!app.state.roomMesh) {
+    if (!state.roomMesh) {
         const geometry = new THREE.IcosahedronGeometry(1, 20);
-        app.state.roomMesh = new THREE.Mesh(
+        state.roomMesh = new THREE.Mesh(
             geometry,
-            app.state.shaderMaterial || new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true })
+            state.shaderMaterial || new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true })
         );
-        app.three.scene.add(app.state.roomMesh);
-    } else if (app.state.shaderMaterial && app.state.roomMesh.material !== app.state.shaderMaterial) {
-        app.state.roomMesh.material = app.state.shaderMaterial;
+        scene.add(state.roomMesh);
+    } else if (state.shaderMaterial && state.roomMesh.material !== state.shaderMaterial) {
+        state.roomMesh.material = state.shaderMaterial;
     }
 
-    const geometry = app.state.roomMesh.geometry;
-    app.three.rayLinesGroup.clear();
+    const geometry = state.roomMesh.geometry;
+    rayLinesGroup.clear();
 
-    const baseRadiusRaw = parseFloat(app.dom.baseRadius?.value ?? '1');
-    const noiseFreqRaw = parseFloat(app.dom.noiseFrequency?.value ?? '0.2');
-    const noiseAmpRaw = parseFloat(app.dom.noiseAmplitude?.value ?? '0.2');
-
-    const baseRadius = Math.max(Number.isFinite(baseRadiusRaw) ? baseRadiusRaw : 1, 0.01);
-    const noiseFreq = Number.isFinite(noiseFreqRaw) ? noiseFreqRaw : 0.2;
-    const noiseAmp = Number.isFinite(noiseAmpRaw) ? noiseAmpRaw : 0.2;
+    const baseRadius = Math.max(parseFloat(dom.baseRadius?.value ?? '1'), 0.01);
+    const noiseFreq = parseFloat(dom.noiseFrequency?.value ?? '0.2');
+    const noiseAmp = parseFloat(dom.noiseAmplitude?.value ?? '0.2');
 
     const positionAttribute = geometry.getAttribute('position');
-
-    if (!app.state.baseVertexDirections || app.state.baseVertexDirections.length !== positionAttribute.count * 3) {
-        app.state.baseVertexDirections = new Float32Array(positionAttribute.count * 3);
+    if (!state.baseVertexDirections || state.baseVertexDirections.length !== positionAttribute.count * 3) {
+        state.baseVertexDirections = new Float32Array(positionAttribute.count * 3);
         const dir = new THREE.Vector3();
         for (let i = 0; i < positionAttribute.count; i++) {
             dir.fromBufferAttribute(positionAttribute, i).normalize();
             const idx = i * 3;
-            app.state.baseVertexDirections[idx] = dir.x;
-            app.state.baseVertexDirections[idx + 1] = dir.y;
-            app.state.baseVertexDirections[idx + 2] = dir.z;
+            state.baseVertexDirections[idx] = dir.x;
+            state.baseVertexDirections[idx + 1] = dir.y;
+            state.baseVertexDirections[idx + 2] = dir.z;
         }
     }
 
@@ -288,21 +281,18 @@ function buildRoomGeometry() {
     for (let i = 0; i < positionAttribute.count; i++) {
         const idx = i * 3;
         baseVec.set(
-            app.state.baseVertexDirections[idx],
-            app.state.baseVertexDirections[idx + 1],
-            app.state.baseVertexDirections[idx + 2]
+            state.baseVertexDirections[idx],
+            state.baseVertexDirections[idx + 1],
+            state.baseVertexDirections[idx + 2]
         );
 
         displaced.copy(baseVec).multiplyScalar(baseRadius);
-
-        const noiseValue = app.state.noise3D(
+        const noiseValue = state.noise3D(
             baseVec.x * noiseFreq,
             baseVec.y * noiseFreq,
             baseVec.z * noiseFreq
         );
-        const displacement = noiseAmp * noiseValue;
-
-        displaced.addScaledVector(baseVec, displacement);
+        displaced.addScaledVector(baseVec, noiseAmp * noiseValue);
 
         positionAttribute.setXYZ(i, displaced.x, displaced.y, displaced.z);
     }
@@ -315,98 +305,107 @@ function buildRoomGeometry() {
 
 function rebuildRoom() {
     buildRoomGeometry();
-    updateWorkerGeometry();
-    injectAmplifierUniforms(app.state.shaderMaterial);
 }
-
-/**
- * Worker
- */
+// -----------------------------------------------------------------------------
+// Worker
+// -----------------------------------------------------------------------------
 function initWorker() {
-    if (app.worker.instance) app.worker.instance.terminate();
+    if (workerInstance) workerInstance.terminate();
 
     try {
-        app.worker.instance = new Worker(new URL('./raytracing-worker.js', import.meta.url), { type: 'module' });
-
-        app.worker.instance.onmessage = (event) => {
-            const { type } = event.data;
-            switch (type) {
-                case 'ready':
-                    console.log('Modern ES Module BVH worker initialized');
-                    updateWorkerGeometry();
-                    break;
-                case 'geometrySet':
-                    console.log('Worker geometry updated BVH');
-                    break;
-                case 'progress': {
-                    const progress = Math.round(event.data.progress * 100);
-                    const rps = event.data.raysPerSecond || 0;
-                    const arrivals = event.data.currentArrivals || 0;
-                    setStatus(`Simulating (Modern BVH Worker)... ${progress}% (${rps} rays/sec, ${arrivals} arrivals)`);
-                    break;
-                }
-                case 'complete':
-                    console.log(`Modern BVH Worker simulation complete: ${event.data.totalArrivals} arrivals`);
-                    console.log(`Performance: ${event.data.avgRaysPerSecond} rays/sec average`);
-                    console.timeEnd('Worker Simulation');
-                    if (Array.isArray(event.data.arrivals)) {
-                        plotImpulseResponse(event.data.arrivals);
-                    } else {
-                        console.warn('Worker completed without arrivals payload; skipping IR plotting.');
-                    }
-                    if (app.dom.startButton) {
-                        app.dom.startButton.disabled = false;
-                    }
-                    app.state.isSimulating = false;
-                    setStatus(`Complete: ${event.data.totalArrivals} arrivals (${event.data.avgRaysPerSecond} rays/sec)`);
-                    break;
-                case 'error':
-                    console.error('Modern BVH Worker error:', event.data.error);
-                    fallbackToSimpleBVH();
-                    break;
-                default:
-                    break;
-            }
-        };
-
-        app.worker.instance.onerror = (error) => {
+        workerInstance = new Worker(new URL('./raytracing-worker.js', import.meta.url), { type: 'module' });
+        workerInstance.onmessage = handleWorkerMessage;
+        workerInstance.onerror = (error) => {
             console.error('Modern worker failed to load:', error);
             fallbackToSimpleBVH();
         };
-
-        app.worker.instance.postMessage({ type: 'init' });
+        workerInstance.postMessage({ type: 'init' });
     } catch (error) {
         console.error('Failed to create modern worker:', error);
         fallbackToSimpleBVH();
     }
 }
 
+function handleWorkerMessage(event) {
+    const message = event.data;
+    const { type } = message;
+    
+    switch (type) {
+        case 'ready':
+            console.log('Modern ES Module BVH worker initialized');
+            updateWorkerGeometry();
+            break;
+        case 'geometrySet':
+            console.log('Worker geometry updated BVH');
+            state.workerGeometryReady = true;
+            if (dom.startButton && !state.isSimulating) {
+                dom.startButton.disabled = false;
+            }
+            break;
+        case 'progress': {
+            const progress = Math.round((message.progress || 0) * 100);
+            const rps = message.raysPerSecond || 0;
+            const arrivals = message.currentArrivals || 0;
+            setStatus(`Simulating (Modern BVH Worker)... ${progress}% (${rps} rays/sec, ${arrivals} arrivals)`);
+            break;
+        }
+        case 'complete': {
+            const totalArrivals = message.totalArrivals || 0;
+            const avgRps = message.avgRaysPerSecond || 0;
+            
+            console.log(`Modern BVH Worker simulation complete: ${totalArrivals} arrivals`);
+            console.log(`Performance: ${avgRps} rays/sec average`);
+            //console.timeEnd('Worker Simulation');
+            
+            // Handle multi-band or single-band results
+            if (message.arrivalsByBand && message.freqBands) {
+                plotMultiBandImpulseResponse(message.arrivalsByBand, message.freqBands);
+            } else if (message.arrivals) {
+                plotImpulseResponse(message.arrivals);
+            } else {
+                console.warn('Worker completed without arrivals payload; skipping IR plotting.');
+            }
+            
+            if (dom.startButton) dom.startButton.disabled = false;
+            state.isSimulating = false;
+            setStatus(`Complete: ${totalArrivals} arrivals (${avgRps} rays/sec)`);
+            break;
+        }
+        case 'error':
+            console.error('Modern BVH Worker error:', message.error || message.data?.error);
+            fallbackToSimpleBVH();
+            break;
+        default:
+            break;
+    }
+}
+
 function fallbackToSimpleBVH() {
     console.warn('Falling back: disabling worker and using main-thread simulation.');
-    if (app.worker.instance) {
-        try { app.worker.instance.terminate(); } catch (err) {
+    if (workerInstance) {
+        try { workerInstance.terminate(); } catch (err) {
             console.error('Failed to terminate worker cleanly:', err);
         }
     }
-    app.worker.instance = null;
+    workerInstance = null;
     const useWebWorker = document.getElementById('useWebWorker');
     if (useWebWorker) useWebWorker.checked = false;
     setStatus('Worker unavailable. Using main thread.');
-    if (app.dom.startButton) {
-        app.dom.startButton.disabled = false;
-    }
-    app.state.isSimulating = false;
+    if (dom.startButton) dom.startButton.disabled = false;
+    state.isSimulating = false;
 }
 
 function updateWorkerGeometry() {
-    if (!app.worker.instance || !app.state.roomMesh) return;
+    if (!workerInstance || !state.roomMesh) return;
 
-    const geometry = app.state.roomMesh.geometry;
+    state.workerGeometryReady = false;
+
+    const geometry = state.roomMesh.geometry;
     const positions = geometry.attributes.position.array;
     const normals = geometry.attributes.normal.array;
     const indices = geometry.index ? geometry.index.array : null;
 
-    app.worker.instance.postMessage({
+    workerInstance.postMessage({
         type: 'setGeometry',
         data: {
             roomGeometry: {
@@ -414,84 +413,166 @@ function updateWorkerGeometry() {
                 normals: Array.from(normals),
                 indices: indices ? Array.from(indices) : null
             },
-            emitterRadius: app.config.EMITTER_RADIUS,
+            emitterRadius: CONFIG.EMITTER_RADIUS,
             emitterPosition: { x: 0, y: 0, z: 0 }
         }
     });
 }
 
-async function init() {
-    if (app.state.initialized) return;
-    try {
-        await initShader();
-        const seedValue = app.dom.randomSeed?.value;
-        applySeed(seedValue || undefined);
-        rebuildRoom();
-        initWorker();
-        animate();
-        app.state.initialized = true;
-    } catch (error) {
-        console.error('Initialization failed:', error);
-    }
-}
-
-// =================================================================
-// ==  Audio Context and Impulse Response Generation
-// =================================================================
-
-async function startApp() {
-    if (!app.state.initialized) {
-        await init();
-    }
-    initAudioContext();
-    if (app.audio.context && app.audio.context.state === 'suspended') {
-        await app.audio.context.resume();
-    }
-}
+// -----------------------------------------------------------------------------
+// Audio + WaveSurfer
+// -----------------------------------------------------------------------------
 function initAudioContext() {
-    if (app.audio.context) return;
-    app.audio.context = new (window.AudioContext || window.webkitAudioContext)();
-    app.audio.convolver = app.audio.context.createConvolver();
-    app.audio.masterGain = app.audio.context.createGain();
-    app.audio.amplitudeMeter = createAmplitudeMeter(app.audio.context, app.audio.masterGain, { fftSize: 512, smoothingTimeConstant: 1 });
+    if (audioContext) return;
 
-    app.audio.convolver.connect(app.audio.masterGain);
-    app.audio.masterGain.connect(app.audio.context.destination);
-    console.log(`AudioContext Initialized. It's a fine Thursday afternoon here in London.`);
-    const weq8 = new WEQ8Runtime(app.audio.context);
-    app.audio.convolver.connect(weq8.input);
-    weq8.connect(app.audio.masterGain);
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    convolver = audioContext.createConvolver();
+    dryGain = audioContext.createGain();
+    wetGain = audioContext.createGain();
+    masterGain = audioContext.createGain();
+    amplitudeMeter = createAmplitudeMeter(audioContext, masterGain, { fftSize: 512, smoothingTimeConstant: 1 });
+
+    const dryDb = drySliderCtrl ? drySliderCtrl.getDb() : 0;
+    const wetDb = wetSliderCtrl ? wetSliderCtrl.getDb() : -6;
+    
+    dryGain.gain.value = dbToLinear(dryDb);
+    wetGain.gain.value = dbToLinear(wetDb);
+
+    console.log('Initial dry gain:', dryGain.gain.value, 'from', dryDb, 'dB');
+    console.log('Initial wet gain:', wetGain.gain.value, 'from', wetDb, 'dB');
+
+    convolver.connect(wetGain);
+    dryGain.connect(masterGain);
+    wetGain.connect(masterGain);
+    masterGain.connect(audioContext.destination);
+
+    console.log(`AudioContext Initialized.`);
+
+    weq8Runtime = new WEQ8Runtime(audioContext);
+    wetGain.connect(weq8Runtime.input);
+    dryGain.connect(weq8Runtime.input);
+    weq8Runtime.connect(masterGain);
+
     const weq8UI = document.querySelector('weq8-ui');
-    if (weq8UI) {
-        weq8UI.runtime = weq8;
+    if (weq8UI) weq8UI.runtime = weq8Runtime;
+
+    rmsEnvelope = new EnvelopeFollower({ attack: 0.1, release: 0.1, sampleRate: 120 });
+    peakEnvelope = new EnvelopeFollower({ attack: 0.1, release: 0.1, sampleRate: 120 });
+}
+
+function runRealtimeSimulation() {
+    if (state.isSimulating) return;
+    
+    const useWebWorker = dom.useWebWorker?.checked ?? true;
+    const quickSimParams = {
+        numRays: 1500,  // Quick preview
+        // use frequency-dependent absorption only
+        absorptionCoeffs: {
+            200: getNumericInputValue('absorption200', 0.1),
+            800: getNumericInputValue('absorption800', 0.15),
+            3200: getNumericInputValue('absorption3200', 0.2),
+            10000: getNumericInputValue('absorption10000', 0.25)
+        },
+        freqBands: CONFIG.FREQ_BANDS,
+        seed: dom.randomSeed?.value ?? '',
+        speedOfSound: CONFIG.SPEED_OF_SOUND,
+        maxBounces: state.maxBounces,
+        batchSize: 5000
+    };
+
+    if (useWebWorker && workerInstance && state.workerGeometryReady) {
+        state.isSimulating = true;
+        setStatus('Quick preview...');
+        workerInstance.postMessage({
+            type: 'simulate',
+            data: quickSimParams
+        });
+    } else if (!useWebWorker) {
+        runQuickMainThreadSimulation(quickSimParams);
     }
 }
 
-function createIRAudioBuffer(arrivals, sampleRate) {
-    if (!app.audio.context) {
-        initAudioContext();
+function runQuickMainThreadSimulation(params) {
+    state.isSimulating = true;
+    setStatus('Quick preview (main thread)...');
+
+    const seed = params.seed || '';
+    const restoreRandom = Math.random;
+    seedrandom(seed || undefined, { global: true });
+
+    const arrivalsByBand = {};
+    const freqBands = params.freqBands ?? CONFIG.FREQ_BANDS;
+    const absorptionCoeffs = params.absorptionCoeffs ?? {};
+    const numRays = params.numRays || 1500;
+
+    for (let i = 0; i < numRays; i++) {
+        vectors.origin.set(0, 0, 0);
+        vectors.direction.randomDirection();
+        let totalDistance = 0;
+        let amplitude = 1.0;
+        let bounceCount = 0;
+
+        // assign this ray to a frequency band (randomly)
+        const band = freqBands[Math.floor(Math.random() * freqBands.length)];
+        const reflectionCoefficient = 1.0 - (absorptionCoeffs[band] ?? 0.2);
+
+        for (let j = 0; j < params.maxBounces; j++) {
+            raycaster.set(vectors.origin, vectors.direction);
+            const roomIntersects = raycaster.intersectObject(state.roomMesh);
+            const receiverIntersects = emitterMesh ? raycaster.intersectObject(emitterMesh) : [];
+
+            if (receiverIntersects.length > 0 && (roomIntersects.length === 0 || receiverIntersects[0].distance < roomIntersects[0].distance)) {
+                if (receiverIntersects[0].distance > 0.001) {
+                    totalDistance += receiverIntersects[0].distance;
+                    let finalAmplitude = amplitude;
+                    (arrivalsByBand[band] = arrivalsByBand[band] || []).push({ time: totalDistance / CONFIG.SPEED_OF_SOUND, amplitude: finalAmplitude });
+                    break;
+                }
+            }
+
+            if (roomIntersects.length > 0) {
+                const intersection = roomIntersects[0];
+                bounceCount++;
+                totalDistance += intersection.distance;
+                amplitude *= reflectionCoefficient;
+                vectors.origin.copy(intersection.point);
+                vectors.direction.reflect(intersection.face.normal);
+                vectors.temp.copy(vectors.direction).multiplyScalar(0.001);
+                vectors.origin.add(vectors.temp);
+            } else {
+                break;
+            }
+        }
     }
-    const ctx = app.audio.context;
-    sampleRate = sampleRate || ctx.sampleRate;
+
+    // Render multi-band IR
+    plotMultiBandImpulseResponse(arrivalsByBand, freqBands);
+    setStatus(`Quick preview: ${Object.values(arrivalsByBand).reduce((s,a)=>s+a.length,0)} arrivals`);
+    Math.random = restoreRandom;
+    state.isSimulating = false;
+}
+
+
+
+function createIRAudioBuffer(arrivals, sampleRateOverride) {
+    initAudioContext();
+    const sampleRate = sampleRateOverride || audioContext.sampleRate;
 
     if (arrivals.length === 0) {
-        // Return a short, silent buffer to avoid errors with empty data
-        return ctx.createBuffer(1, 1, sampleRate);
+        return audioContext.createBuffer(1, 1, sampleRate);
     }
-    
+
     const maxTime = arrivals.reduce((max, arr) => Math.max(max, arr.time), 0);
-    const tailSeconds = 0.5;
-    const minDuration = 1;
-    const duration = Math.max(maxTime + tailSeconds, minDuration);
+    const duration = Math.max(maxTime + 0.5, 1);
     const bufferLength = Math.ceil(duration * sampleRate);
-    const irBuffer = ctx.createBuffer(1, bufferLength, sampleRate);
+    const irBuffer = audioContext.createBuffer(1, bufferLength, sampleRate);
     const bufferData = irBuffer.getChannelData(0);
-    
+
     for (const arrival of arrivals) {
         const exactSample = arrival.time * sampleRate;
         const baseSample = Math.floor(exactSample);
         const fraction = exactSample - baseSample;
-        
+
         if (baseSample < bufferLength - 1) {
             bufferData[baseSample] += arrival.amplitude * (1 - fraction);
             bufferData[baseSample + 1] += arrival.amplitude * fraction;
@@ -500,19 +581,16 @@ function createIRAudioBuffer(arrivals, sampleRate) {
         }
     }
 
-    const maxSample = Math.max(...bufferData.map(Math.abs));
+    const maxSample = bufferData.reduce((max, sample) => Math.max(max, Math.abs(sample)), 0);
     if (maxSample > 1.0) {
-        for (let i = 0; i < bufferData.length; i++) {
-            bufferData[i] /= maxSample;
-        }
+        for (let i = 0; i < bufferData.length; i++) bufferData[i] /= maxSample;
     }
-    
+
     return irBuffer;
 }
+
 function initWaveSurfer() {
-    if (app.audio.wavesurfer) {
-        app.audio.wavesurfer.destroy();
-    }
+    if (wavesurfer) wavesurfer.destroy();
 
     initAudioContext();
 
@@ -522,18 +600,14 @@ function initWaveSurfer() {
         return null;
     }
     waveformContainer.innerHTML = '';
-    
-    try {
 
-        const topTimeline = TimelinePlugin.create({
+    try {
+        const timeline = TimelinePlugin.create({
             height: 10,
             insertPosition: 'beforebegin',
             timeInterval: 0.5,
             primaryLabelInterval: 0.05,
-            style: {
-                fontSize: '10px',
-                color: '#2D5B88',
-            },
+            style: { fontSize: '10px', color: '#2D5B88' }
         });
 
         const ws = WaveSurfer.create({
@@ -541,11 +615,10 @@ function initWaveSurfer() {
             waveColor: 'rgb(200, 100, 0)',
             progressColor: 'rgb(100, 50, 0)',
             height: 100,
-            sampleRate: app.audio.context ? app.audio.context.sampleRate : 44100,
+            sampleRate: audioContext ? audioContext.sampleRate : 44100,
             interact: true,
             dragToSeek: true,
-            plugins: [topTimeline],
-
+            plugins: [timeline]
         });
 
         ws.registerPlugin(
@@ -554,23 +627,16 @@ function initWaveSurfer() {
                 scale: 'linear',
                 useWebWorker: true,
                 windowFunc: 'hann',
-                fftSamples: 1024,
-
+                fftSamples: 1024
             })
         );
 
         const audioElement = ws.getMediaElement();
-        app.audio.impulseResponseSource = app.audio.context.createMediaElementSource(audioElement);
-        app.audio.impulseResponseSource.connect(app.audio.masterGain);
-        app.audio.rmsEnvelope = new EnvelopeFollower({ attack: 0.1, release: 1, sampleRate: 120 });
-        app.audio.peakEnvelope = new EnvelopeFollower({ attack: 0.1, release: 1, sampleRate: 120 });
-        ws.on('error', (err) => {
-            console.error('WaveSurfer error:', err);
-        });
-        
-        ws.on('click', () => {
-            ws.play();
-        });
+        impulseResponseSource = audioContext.createMediaElementSource(audioElement);
+        impulseResponseSource.connect(masterGain);
+
+        ws.on('error', (err) => console.error('WaveSurfer error:', err));
+        ws.on('click', () => ws.play());
 
         return ws;
     } catch (error) {
@@ -579,68 +645,207 @@ function initWaveSurfer() {
     }
 }
 
-
 function plotImpulseResponse(arrivals) {
-    app.audio.wavesurfer = initWaveSurfer();
-    const ws = app.audio.wavesurfer;
-    if (!ws) return;
+    wavesurfer = initWaveSurfer();
+    if (!wavesurfer) return;
 
-    if (arrivals.length === 0) {
-        return; // initWaveSurfer already cleared the view
-    }
+    if (arrivals.length === 0) return;
 
     initAudioContext();
 
     const maxAbsAmplitude = arrivals.reduce((max, arr) => Math.max(max, Math.abs(arr.amplitude)), 0);
     const headroom = 0.988;
-    const normalizedArrivals = maxAbsAmplitude > 0 ? 
-        arrivals.map(arr => ({ ...arr, amplitude: (arr.amplitude / maxAbsAmplitude) * headroom })) : 
-        arrivals;
+    const normalizedArrivals = maxAbsAmplitude > 0
+        ? arrivals.map(arr => ({ ...arr, amplitude: (arr.amplitude / maxAbsAmplitude) * headroom }))
+        : arrivals;
 
-    app.audio.impulseResponseBuffer = createIRAudioBuffer(normalizedArrivals);
+    impulseResponseBuffer = createIRAudioBuffer(normalizedArrivals);
 
-    if (app.audio.impulseResponseBuffer && app.audio.convolver) {
-        app.audio.convolver.buffer = app.audio.impulseResponseBuffer;
-        if (app.dom.downloadBtn) {
-            app.dom.downloadBtn.disabled = false;
-        }
+    if (impulseResponseBuffer && convolver) {
+        convolver.buffer = impulseResponseBuffer;
+        if (dom.downloadBtn) dom.downloadBtn.disabled = false;
         setStatus('Impulse Response loaded! Ready for auralization.');
 
-        const blob = audioBufferToWav(app.audio.impulseResponseBuffer);
+        const blob = audioBufferToWav(impulseResponseBuffer);
         if (blob) {
-            ws.load(URL.createObjectURL(blob));
+            wavesurfer.load(URL.createObjectURL(blob));
         } else {
             console.error('Failed to create WAV blob from AudioBuffer');
         }
     }
 }
 
+async function bandpassIRBuffer(irBuffer, centerFreq, Q = 1) {
+    const offline = new OfflineAudioContext(1, irBuffer.length, irBuffer.sampleRate);
+    const source = offline.createBufferSource();
+    source.buffer = irBuffer;
+
+    const filter = offline.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = centerFreq;
+    filter.Q.value = Q;
+
+    source.connect(filter).connect(offline.destination);
+    source.start();
+
+    return await offline.startRendering();
+}
+
+// Hann window function
+function hannWindow(N) {
+    const win = new Float32Array(N);
+    for (let n = 0; n < N; n++) {
+        win[n] = 0.5 * (1 - Math.cos(2 * Math.PI * n / (N - 1)));
+    }
+    return win;
+}
+
+// Generate a windowed-sinc FIR bandpass kernel
+function firwinBandpass(numTaps, fLow, fHigh, fs) {
+    const kernel = new Float32Array(numTaps);
+    const win = hannWindow(numTaps);
+    const M = numTaps - 1;
+    const fc1 = fLow / fs;
+    const fc2 = fHigh / fs;
+    for (let n = 0; n < numTaps; n++) {
+        const k = n - M / 2;
+        let h;
+        if (k === 0) {
+            h = 2 * (fc2 - fc1);
+        } else {
+            h = (Math.sin(2 * Math.PI * fc2 * k) - Math.sin(2 * Math.PI * fc1 * k)) / (Math.PI * k);
+        }
+        kernel[n] = h * win[n];
+    }
+    // Normalize kernel to unity gain at DC
+    const sum = kernel.reduce((a, b) => a + b, 0);
+    for (let n = 0; n < numTaps; n++) kernel[n] /= sum;
+    return kernel;
+}
+
+// Helper: Apply FIR filter to an AudioBuffer using ConvolverNode
+async function applyFIRFilter(irBuffer, firKernel) {
+    const offline = new OfflineAudioContext(1, irBuffer.length + firKernel.length, irBuffer.sampleRate);
+    const kernelBuffer = offline.createBuffer(1, firKernel.length, irBuffer.sampleRate);
+    kernelBuffer.copyToChannel(firKernel, 0);
+
+    const src = offline.createBufferSource();
+    src.buffer = irBuffer;
+    const convolver = offline.createConvolver();
+    convolver.buffer = kernelBuffer;
+
+    src.connect(convolver).connect(offline.destination);
+    src.start();
+
+    return await offline.startRendering();
+}
+
+async function plotMultiBandImpulseResponse(arrivalsByBand, freqBands) {
+    wavesurfer = initWaveSurfer();
+    if (!wavesurfer) return;
+
+    initAudioContext();
+
+    console.log('Processing multi-band impulse response (FIR):', freqBands);
+
+    // FIR filter parameters
+    const numTaps = 257; // Odd number, e.g. 101-513 for sharper filters
+    const sampleRate = audioContext.sampleRate;
+
+    // Create and FIR-filter IR buffer for each frequency band
+    const irBuffers = {};
+    for (const freq of freqBands) {
+        const arrivals = arrivalsByBand[freq];
+        if (arrivals && arrivals.length > 0) {
+            const maxAbsAmplitude = arrivals.reduce((max, arr) => Math.max(max, Math.abs(arr.amplitude)), 0);
+            const headroom = 0.988;
+            const normalizedArrivals = maxAbsAmplitude > 0
+                ? arrivals.map(arr => ({ ...arr, amplitude: (arr.amplitude / maxAbsAmplitude) * headroom }))
+                : arrivals;
+
+            const rawBuffer = createIRAudioBuffer(normalizedArrivals);
+
+            // FIR bandpass kernel for this band
+            const centerFreq = parseFloat(freq);
+            const bandwidth = centerFreq; // e.g. 1 octave bandwidth; adjust as needed
+            const fLow = Math.max(centerFreq - bandwidth / 2, 20); // avoid sub-audible
+            const fHigh = Math.min(centerFreq + bandwidth / 2, sampleRate / 2 - 1);
+
+            const firKernel = firwinBandpass(numTaps, fLow, fHigh, sampleRate);
+
+            // Apply FIR filter
+            irBuffers[freq] = await applyFIRFilter(rawBuffer, firKernel);
+        }
+    }
+
+    // Combine frequency bands into single IR using filterbank
+    impulseResponseBuffer = combineFrequencyBands(irBuffers, freqBands);
+
+    if (impulseResponseBuffer && convolver) {
+        convolver.buffer = impulseResponseBuffer;
+        if (dom.downloadBtn) dom.downloadBtn.disabled = false;
+        setStatus('Multi-band Impulse Response loaded!');
+
+        const blob = audioBufferToWav(impulseResponseBuffer);
+        if (blob) {
+            wavesurfer.load(URL.createObjectURL(blob));
+        }
+    }
+}
+
+function combineFrequencyBands(irBuffers, freqBands) {
+    if (!audioContext) return null;
+    
+    const freqs = freqBands.sort((a, b) => a - b);
+    
+    // Find longest buffer
+    let maxLength = 0;
+    freqs.forEach(freq => {
+        if (irBuffers[freq]) {
+            maxLength = Math.max(maxLength, irBuffers[freq].length);
+        }
+    });
+    
+    if (maxLength === 0) return null;
+    
+    const sampleRate = audioContext.sampleRate;
+    const combinedBuffer = audioContext.createBuffer(1, maxLength, sampleRate);
+    const combinedData = combinedBuffer.getChannelData(0);
+    
+    // Sum all bands
+    freqs.forEach(freq => {
+        const irBuffer = irBuffers[freq];
+        if (!irBuffer) return;
+        const irData = irBuffer.getChannelData(0);
+        for (let i = 0; i < irData.length; i++) {
+            combinedData[i] += irData[i];
+        }
+    });
+
+    // Normalize to headroom (e.g., 0.98)
+    const maxSample = combinedData.reduce((max, sample) => Math.max(max, Math.abs(sample)), 0);
+    if (maxSample > 0) {
+        const headroom = 0.98;
+        for (let i = 0; i < combinedData.length; i++) {
+            combinedData[i] = (combinedData[i] / maxSample) * headroom;
+        }
+    }
+    
+    return combinedBuffer;
+}
+
+function dbToLinear(db) {
+    return Math.pow(10, db / 20);
+}
+
 function audioBufferToWav(aBuffer) {
-    let numOfChan = aBuffer.numberOfChannels,
-        length = aBuffer.length * numOfChan * 2 + 44,
-        buffer = new ArrayBuffer(length),
-        view = new DataView(buffer),
-        channels = [],
-        i, sample,
-        offset = 0,
-        pos = 0;
-
-    // write WAVE header
-    setUint32(0x46464952); // "RIFF"
-    setUint32(length - 8); // file length - 8
-    setUint32(0x45564157); // "WAVE"
-
-    setUint32(0x20746d66); // "fmt " chunk
-    setUint32(16); // length = 16
-    setUint16(1); // PCM (uncompressed)
-    setUint16(numOfChan);
-    setUint32(aBuffer.sampleRate);
-    setUint32(aBuffer.sampleRate * 2 * numOfChan); // avg. bytes/sec
-    setUint16(numOfChan * 2); // block-align
-    setUint16(16); // 16-bit
-
-    setUint32(0x61746164); // "data" - chunk
-    setUint32(length - pos - 4); // chunk length
+    const numOfChan = aBuffer.numberOfChannels;
+    const length = aBuffer.length * numOfChan * 2 + 44;
+    const buffer = new ArrayBuffer(length);
+    const view = new DataView(buffer);
+    const channels = [];
+    let offset = 0;
+    let pos = 0;
 
     function setUint16(data) {
         view.setUint16(pos, data, true);
@@ -652,303 +857,175 @@ function audioBufferToWav(aBuffer) {
         pos += 4;
     }
 
-    // write interleaved data
-    for (i = 0; i < aBuffer.numberOfChannels; i++)
-        channels.push(aBuffer.getChannelData(i));
+    setUint32(0x46464952);
+    setUint32(length - 8);
+    setUint32(0x45564157);
+    setUint32(0x20746d66);
+    setUint32(16);
+    setUint16(1);
+    setUint16(numOfChan);
+    setUint32(aBuffer.sampleRate);
+    setUint32(aBuffer.sampleRate * 2 * numOfChan);
+    setUint16(numOfChan * 2);
+    setUint16(16);
+    setUint32(0x61746164);
+    setUint32(length - pos - 4);
+
+    for (let i = 0; i < numOfChan; i++) channels.push(aBuffer.getChannelData(i));
 
     while (pos < length) {
-        for (i = 0; i < numOfChan; i++) { // interleave channels
-            sample = Math.max(-1, Math.min(1, channels[i][offset])); // clamp
-            sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0; // scale to 16-bit signed int
-            view.setInt16(pos, sample, true); // write 16-bit sample
+        for (let i = 0; i < numOfChan; i++) {
+            let sample = Math.max(-1, Math.min(1, channels[i][offset]));
+            sample = (sample < 0 ? sample * 32768 : sample * 32767) | 0;
+            view.setInt16(pos, sample, true);
             pos += 2;
         }
-        offset++ // next source sample
+        offset++;
     }
 
-    return new Blob([buffer], { type: "audio/wav" });
+    return new Blob([buffer], { type: 'audio/wav' });
 }
 
-function getVolume(mesh, worldSpace = true) {
-    if (!mesh || !mesh.geometry) return 0;
-    const geometry = mesh.geometry;
-    if (!geometry.boundsTree) {
-        geometry.computeBoundsTree({ setBoundingBox: false });
-    }
-    const bvh = geometry.boundsTree;
-    const tmp = new THREE.Vector3();
-    let vol6 = 0;
-    bvh.shapecast({
-        intersectsBounds: () => INTERSECTED,
-        intersectsTriangle: (tri) => {
-            // Accumulate 6x signed volume contribution of tetrahedron (0, a, b, c)
-            tmp.crossVectors(tri.b, tri.c);
-            vol6 += tri.a.dot(tmp);
-            return false;
-        }
-    });
-    let volume = vol6 / 6;
-    if (worldSpace) {
-        // Multiply by |det(linear part of matrixWorld)| to account for scaling/shear
-        const e = this.targetMesh.matrixWorld.elements;
-        const a11 = e[0], a12 = e[4], a13 = e[8];
-        const a21 = e[1], a22 = e[5], a23 = e[9];
-        const a31 = e[2], a32 = e[6], a33 = e[10];
-        const det = a11 * (a22 * a33 - a23 * a32)
-                  - a12 * (a21 * a33 - a23 * a31)
-                  + a13 * (a21 * a32 - a22 * a31);
-        volume *= Math.abs(det);
-    }
-    return Math.abs(volume);
-}
+// -----------------------------------------------------------------------------
+// Samples
+// -----------------------------------------------------------------------------
+async function populateSampleDropdown() {
+    if (!dom.sampleAudioSelect) return;
 
-function calculateSurfaceArea(mesh, worldSpace = true) {
-    if (!mesh || !mesh.geometry) return 0;
-    const geometry = mesh.geometry;
-    if (!geometry.boundsTree) {
-        geometry.computeBoundsTree({ setBoundingBox: false });
-    }
-    const bvh = geometry.boundsTree;
-    let totalArea = 0;
-    // Use BVH to iterate through all triangles efficiently
-    bvh.shapecast({
-        intersectsBounds: () => INTERSECTED,
-        intersectsTriangle: (tri) => {
-            // Calculate triangle area using cross product: |AB × AC| / 2
-            const ab = new THREE.Vector3().subVectors(tri.b, tri.a);
-            const ac = new THREE.Vector3().subVectors(tri.c, tri.a);
-            const cross = new THREE.Vector3().crossVectors(ab, ac);
-            const area = cross.length() * 0.5;
-            
-            totalArea += area;
-            return false; // Continue traversal
-        }
-    });
-    if (worldSpace) {
-        // For surface area, we need to account for scaling
-        // Surface area scales by the square of the scale factor
-        const scale = this.targetMesh.scale.x; // Assuming uniform scaling
-        totalArea *= scale * scale;
-    }
-    return totalArea;
-}
-
-
-
-
-// =================================================================
-// ==  UI Event Listeners & Controls
-// =================================================================
-
-
-/*
-audioUpload.addEventListener('change', async (event) => {
-    const file = event.target.files[0];
-    if (!file) return;
-    setStatus('Decoding...');
-    playStopBtn.disabled = true;
-    try {
-        const arrayBuffer = await file.arrayBuffer();
-        uploadedAudioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-        playStopBtn.disabled = false;
-        playStopBtn.textContent = 'Play Uploaded Audio';
-    setStatus(`File "${file.name}" loaded.`);
-    } catch (e) {
-    setStatus('Error decoding file.');
-        console.error(e);
-    }
-});*/
-
-
-
-if (app.dom.downloadBtn) {
-    app.dom.downloadBtn.addEventListener('click', () => {
-        if (!app.audio.impulseResponseBuffer) return;
-        const blob = audioBufferToWav(app.audio.impulseResponseBuffer);
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.style.display = 'none';
-        a.href = url;
-        const seedValue = app.dom.randomSeed?.value ?? 'impulse-response';
-        a.download = `IR_${seedValue}.wav`;
-        document.body.appendChild(a);
-        a.click();
-        window.URL.revokeObjectURL(url);
-        document.body.removeChild(a);
-    });
-}
-
-if (app.dom.randomizeSeedBtn && app.dom.randomSeed) {
-    app.dom.randomizeSeedBtn.addEventListener('click', () => {
-        app.dom.randomSeed.value = (Date.now() * Math.random()).toString(36).substr(2, 9);
-        applySeed(app.dom.randomSeed.value);
-        rebuildRoom();
-    });
-}
-
-document.querySelectorAll('input[type="range"]').forEach(slider => {
-    const display = document.getElementById(`${slider.id}-val`);
-    if (display) {
-        display.textContent = slider.value;
-        slider.addEventListener('input', () => { display.textContent = slider.value; });
-    }
-});
-
-if (app.dom.startButton) {
-    app.dom.startButton.addEventListener('click', () => {
-        initAudioContext();
-        const useWebWorker = document.getElementById('useWebWorker')?.checked ?? false;
-        if (useWebWorker && app.worker.instance) {
-            runSimulationWorker();
-        } else {
-            runSimulationMainThread();
-        }
-    });
-}
-
-if (app.dom.sampleAudioSelect) {
-    app.dom.sampleAudioSelect.addEventListener('change', async () => {
-        if (app.state.sampleSourceNode) {
-            app.state.sampleSourceNode.stop(0);
-            app.state.sampleSourceNode = null;
-        }
-        app.state.sampleBuffer = null;
-
-        const url = app.dom.sampleAudioSelect.value;
-        if (!url) return;
-
-        initAudioContext();
-        setStatus('Loading sample…');
-        if (app.dom.playSampleBtn) {
-            app.dom.playSampleBtn.disabled = true;
-        }
-
-        try {
-            const response = await fetch(url);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const arrayBuffer = await response.arrayBuffer();
-            app.state.sampleBuffer = await app.audio.context.decodeAudioData(arrayBuffer);
-            setStatus(`Sample ready: ${url.split('/').pop()}`);
-            if (app.dom.playSampleBtn) {
-                app.dom.playSampleBtn.disabled = false;
-            }
-        } catch (error) {
-            console.error('Sample load failed:', error);
-            setStatus('Error loading sample.');
-        }
-    });
-}
-
-if (app.dom.playSampleBtn) {
-    app.dom.playSampleBtn.addEventListener('click', () => {
-        if (!app.state.sampleBuffer) return;
-        if (app.state.sampleSourceNode) {
-            app.state.sampleSourceNode.stop(0);
-            return;
-        }
-        initAudioContext();
-        app.state.sampleSourceNode = app.audio.context.createBufferSource();
-        app.state.sampleSourceNode.buffer = app.state.sampleBuffer;
-        app.state.sampleSourceNode.connect(app.audio.convolver);
-        app.state.sampleSourceNode.start();
-        app.dom.playSampleBtn.textContent = 'Stop Sample';
-
-        setStatus('Playing sample…');
-
-        app.state.sampleSourceNode.onended = () => {
-            app.state.sampleSourceNode = null;
-            if (app.dom.playSampleBtn) {
-                app.dom.playSampleBtn.textContent = 'Play Sample';
-            }
-            setStatus('Sample finished.');
-        };
-    });
-}
-
-if (app.dom.stopSampleBtn) {
-    app.dom.stopSampleBtn.addEventListener('click', () => {
-        if (app.state.sampleSourceNode) {
-            app.state.sampleSourceNode.stop(0);
-        }
-    });
-}
-
-async function loadSampleList() {
-    const select = app.dom.sampleAudioSelect;
-    if (!select) return;
     const sampleFiles = import.meta.glob('/src/audio/samples/*.{wav,mp3,ogg}', { eager: true });
-    console.log('Sample files found:', Object.keys(sampleFiles));
-    select.innerHTML = '';
-    Object.entries(sampleFiles).forEach(([path, module]) => {
+    const entries = Object.entries(sampleFiles).sort(([a], [b]) => a.localeCompare(b));
+
+    dom.sampleAudioSelect.innerHTML = '';
+    entries.forEach(([path, module]) => {
         const url = module.default ?? path.replace('/src', '');
         const name = path.split('/').pop();
         const option = document.createElement('option');
         option.value = url;
         option.textContent = name;
-        select.appendChild(option);
+        dom.sampleAudioSelect.appendChild(option);
     });
+
+    if (entries.length > 0) {
+        dom.sampleAudioSelect.selectedIndex = 0;
+        await loadSelectedSample(dom.sampleAudioSelect.value);
+    }
 }
 
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', loadSampleList);
-} else {
-    loadSampleList();
+async function loadSelectedSample(url) {
+    stopSamplePlayback();
+    sampleBuffer = null;
+
+    if (!url) return;
+
+    if (!audioContext) {
+        console.warn('AudioContext not initialized yet; sample will load but not play until splash is dismissed.');
+    }
+    
+    setStatus('Loading sample…');
+    if (dom.playSampleBtn) dom.playSampleBtn.disabled = true;
+
+    try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const arrayBuffer = await response.arrayBuffer();
+        
+        if (audioContext) {
+            sampleBuffer = await audioContext.decodeAudioData(arrayBuffer);
+            setStatus(`Sample ready: ${url.split('/').pop()}`);
+            if (dom.playSampleBtn) dom.playSampleBtn.disabled = false;
+        } else {
+            // Store for later decoding
+            window._pendingSampleBuffer = arrayBuffer;
+            setStatus(`Sample loaded (awaiting audio context): ${url.split('/').pop()}`);
+        }
+    } catch (error) {
+        console.error('Sample load failed:', error);
+        setStatus('Error loading sample.');
+    }
 }
 
-// --- WEB WORKER SIMULATION ---
+function stopSamplePlayback() {
+    if (sampleSourceNode) {
+        try { sampleSourceNode.stop(0); } catch {}
+        sampleSourceNode.disconnect();
+        sampleSourceNode = null;
+    }
+    if (dom.playSampleBtn) dom.playSampleBtn.textContent = 'Play Sample';
+}
+
+// -----------------------------------------------------------------------------
+// Simulation
+// -----------------------------------------------------------------------------
+function getNumericInputValue(id, fallback = 0) {
+    const element = document.getElementById(id);
+    if (!element) return fallback;
+    const value = parseFloat(element.value);
+    return Number.isFinite(value) ? value : fallback;
+}
+
+function getIntegerInputValue(id, fallback = 0) {
+    const element = document.getElementById(id);
+    if (!element) return fallback;
+    const value = parseInt(element.value, 10);
+    return Number.isFinite(value) ? value : fallback;
+}
+
 function runSimulationWorker() {
-    if (app.state.isSimulating) return;
-    if (!app.worker.instance) {
+    if (state.isSimulating) return;
+    if (!workerInstance) {
         console.warn('Worker unavailable; running simulation on main thread.');
         runSimulationMainThread();
         return;
     }
 
-    app.state.isSimulating = true;
-    if (app.dom.startButton) {
-        app.dom.startButton.disabled = true;
+    if (!state.workerGeometryReady) {
+        console.warn('Worker geometry not ready yet, please wait...');
+        setStatus('Waiting for geometry update...');
+        return;
     }
+
+    state.isSimulating = true;
+    if (dom.startButton) dom.startButton.disabled = true;
     setStatus('Starting simulation...');
 
-    if (app.three.rayLinesGroup) {
-        while (app.three.rayLinesGroup.children.length > 0) {
-            app.three.rayLinesGroup.remove(app.three.rayLinesGroup.children[0]);
-        }
+    if (rayLinesGroup) {
+        while (rayLinesGroup.children.length > 0) rayLinesGroup.remove(rayLinesGroup.children[0]);
     }
 
     const params = {
         numRays: getIntegerInputValue('numRays', 1000),
-        maxBounces: app.state.maxBounces,
-        wallAbsorption: getNumericInputValue('wallAbsorption', 0.2),
-        diffuseThreshold: getIntegerInputValue('diffuseThreshold', 0),
-        randomizePhase: app.dom.phaseToggle?.checked ?? false,
-        seed: app.dom.randomSeed?.value ?? '',
-        speedOfSound: app.config.SPEED_OF_SOUND,
-        batchSize: 5000 // Larger batches reduce worker overhead
+        maxBounces: state.maxBounces,
+        useFreqDependent: true,
+        absorptionCoeffs: {
+            200: getNumericInputValue('absorption200', 0.1),
+            800: getNumericInputValue('absorption800', 0.15),
+            3200: getNumericInputValue('absorption3200', 0.2),
+            10000: getNumericInputValue('absorption10000', 0.25)
+        },
+        seed: dom.randomSeed?.value ?? '',
+        speedOfSound: CONFIG.SPEED_OF_SOUND,
+        batchSize: 5000
     };
 
     console.log('Starting worker simulation with params:', params);
     console.time('Worker Simulation');
 
-    app.worker.instance.postMessage({
+    workerInstance.postMessage({
         type: 'simulate',
         data: params
     });
 }
 
-// --- OPTIMIZED BATCHED SIMULATION ---
 function runSimulationMainThread() {
-    if (app.state.isSimulating) return;
+    if (state.isSimulating) return;
 
-    app.state.isSimulating = true;
-    if (app.dom.startButton) {
-        app.dom.startButton.disabled = true;
-    }
+    state.isSimulating = true;
+    if (dom.startButton) dom.startButton.disabled = true;
     setStatus('Simulating...');
 
-    const MAX_BOUNCES = app.state.maxBounces;
-    const BATCH_SIZE = 1000; // Optimized batch size for main thread
-    const seed = app.dom.randomSeed?.value || '';
+    const MAX_BOUNCES = state.maxBounces;
+    const BATCH_SIZE = 1000;
+    const seed = dom.randomSeed?.value || '';
     const restoreRandom = Math.random;
     seedrandom(seed || undefined, { global: true });
 
@@ -956,36 +1033,29 @@ function runSimulationMainThread() {
     console.time('Main Thread Simulation');
 
     const numRays = getIntegerInputValue('numRays', 1000);
-    const wallAbsorption = getNumericInputValue('wallAbsorption', 0.2);
-    const diffuseThreshold = getIntegerInputValue('diffuseThreshold', 0);
-    const randomizePhase = app.dom.phaseToggle?.checked ?? false;
-    const raysToVisualize = parseInt(app.dom.raysToVisualizeSlider?.value ?? '0', 10) || 0;
-    const lineColorMode = app.dom.lineColorModeSelect?.value ?? 'random';
-    const reflectionCoefficient = 1.0 - wallAbsorption;
+    const raysToVisualize = parseInt(dom.raysToVisualizeSlider?.value ?? '0', 10) || 0;
+    const lineColorMode = dom.lineColorModeSelect?.value ?? 'random';
 
-    const raycaster = app.three.raycaster;
-    const roomMesh = app.state.roomMesh;
-    const emitterMesh = app.three.emitterMesh;
-    const rayLinesGroup = app.three.rayLinesGroup;
-    const _rayOrigin = app.three.vectors.origin;
-    const _rayDirection = app.three.vectors.direction;
-    const _tempVec = app.three.vectors.temp;
-
-    if (!raycaster || !roomMesh || !emitterMesh || !rayLinesGroup) {
-        console.warn('Simulation prerequisites missing (raycaster/room/emitter).');
+    if (!raycaster || !state.roomMesh || !emitterMesh || !rayLinesGroup) {
+        console.warn('Simulation prerequisites missing.');
         setStatus('Simulation unavailable: scene not ready.');
-        if (app.dom.startButton) {
-            app.dom.startButton.disabled = false;
-        }
+        if (dom.startButton) dom.startButton.disabled = false;
         Math.random = restoreRandom;
-        app.state.isSimulating = false;
+        state.isSimulating = false;
         return;
     }
 
-    const arrivals = [];
+    const freqBands = CONFIG.FREQ_BANDS;
+    const absorptionCoeffs = {
+        200: getNumericInputValue('absorption200', 0.1),
+        800: getNumericInputValue('absorption800', 0.15),
+        3200: getNumericInputValue('absorption3200', 0.2),
+        10000: getNumericInputValue('absorption10000', 0.25)
+    };
+
+    const arrivalsByBand = {};
     let currentRay = 0;
 
-    // Pre-allocate visualization buffers
     const maxSegments = raysToVisualize * MAX_BOUNCES * 2;
     const linePositions = new Float32Array(maxSegments * 3);
     const lineColors = new Float32Array(maxSegments * 3);
@@ -998,29 +1068,30 @@ function runSimulationMainThread() {
         const startTime = performance.now();
 
         for (let i = currentRay; i < endRay; i++) {
-            _rayOrigin.set(0, 0, 0);
-            _rayDirection.randomDirection();
+            vectors.origin.set(0, 0, 0);
+            vectors.direction.randomDirection();
             let totalDistance = 0;
             let amplitude = 1.0;
             let bounceCount = 0;
 
+            // choose band for this ray
+            const band = freqBands[Math.floor(Math.random() * freqBands.length)];
+            const reflectionCoefficient = 1.0 - (absorptionCoeffs[band] ?? 0.2);
+
             const shouldVisualize = i < raysToVisualize;
-            const pathInfo = shouldVisualize ? [{ point: _rayOrigin.clone(), amplitude: 1.0 }] : null;
+            const pathInfo = shouldVisualize ? [{ point: vectors.origin.clone(), amplitude: 1.0 }] : null;
 
             for (let j = 0; j < MAX_BOUNCES; j++) {
-                raycaster.set(_rayOrigin, _rayDirection);
-                const roomIntersects = raycaster.intersectObject(roomMesh);
+                raycaster.set(vectors.origin, vectors.direction);
+                const roomIntersects = raycaster.intersectObject(state.roomMesh);
                 const receiverIntersects = emitterMesh ? raycaster.intersectObject(emitterMesh) : [];
 
                 if (receiverIntersects.length > 0 && (roomIntersects.length === 0 || receiverIntersects[0].distance < roomIntersects[0].distance)) {
                     if (receiverIntersects[0].distance > 0.001) {
                         totalDistance += receiverIntersects[0].distance;
-                        if (shouldVisualize) pathInfo.push({ point: receiverIntersects[0].point.clone(), amplitude: amplitude });
+                        if (shouldVisualize) pathInfo.push({ point: receiverIntersects[0].point.clone(), amplitude });
                         let finalAmplitude = amplitude;
-                        if (randomizePhase && bounceCount > diffuseThreshold) {
-                            finalAmplitude *= (Math.random() < 0.5 ? 1 : -1);
-                        }
-                        arrivals.push({ time: totalDistance / app.config.SPEED_OF_SOUND, amplitude: finalAmplitude });
+                        (arrivalsByBand[band] = arrivalsByBand[band] || []).push({ time: totalDistance / CONFIG.SPEED_OF_SOUND, amplitude: finalAmplitude });
                         break;
                     }
                 }
@@ -1030,18 +1101,17 @@ function runSimulationMainThread() {
                     bounceCount++;
                     totalDistance += intersection.distance;
                     amplitude *= reflectionCoefficient;
-                    _rayOrigin.copy(intersection.point);
-                    if (shouldVisualize) pathInfo.push({ point: _rayOrigin.clone(), amplitude: amplitude });
+                    vectors.origin.copy(intersection.point);
+                    if (shouldVisualize) pathInfo.push({ point: vectors.origin.clone(), amplitude });
 
-                    _rayDirection.reflect(intersection.face.normal);
-                    _tempVec.copy(_rayDirection).multiplyScalar(0.001);
-                    _rayOrigin.add(_tempVec);
+                    vectors.direction.reflect(intersection.face.normal);
+                    vectors.temp.copy(vectors.direction).multiplyScalar(0.001);
+                    vectors.origin.add(vectors.temp);
                 } else {
                     break;
                 }
             }
 
-            // Add visualization data
             if (shouldVisualize && pathInfo) {
                 const pathColor = new THREE.Color().setHSL(Math.random(), 0.8, 0.6);
                 for (let k = 0; k < pathInfo.length - 1; k++) {
@@ -1078,20 +1148,14 @@ function runSimulationMainThread() {
         const raysPerSecond = processed > 0 && batchTime > 0 ? Math.round(processed / (batchTime / 1000)) : 0;
 
         if (currentRay < numRays) {
-            // Update progress with performance info
             setStatus(`Simulating (Main Thread)... ${Math.round((currentRay / numRays) * 100)}% (${raysPerSecond} rays/sec)`);
-
-            // Schedule next batch
             if (window.requestIdleCallback) {
                 requestIdleCallback(processBatch);
             } else {
                 setTimeout(processBatch, 0);
             }
         } else {
-            // Simulation complete - update visualization
-            while (rayLinesGroup.children.length > 0) {
-                rayLinesGroup.remove(rayLinesGroup.children[0]);
-            }
+            while (rayLinesGroup.children.length > 0) rayLinesGroup.remove(rayLinesGroup.children[0]);
 
             if (positionIndex > 0) {
                 const lineGeometry = new THREE.BufferGeometry();
@@ -1103,58 +1167,242 @@ function runSimulationMainThread() {
             }
 
             console.timeEnd('Main Thread Simulation');
-            plotImpulseResponse(arrivals);
-            if (app.dom.startButton) {
-                app.dom.startButton.disabled = false;
-            }
-            setStatus(`Simulation complete: ${arrivals.length} arrivals`);
+            // plot multi-band IR
+            plotMultiBandImpulseResponse(arrivalsByBand, freqBands);
+            if (dom.startButton) dom.startButton.disabled = false;
+            setStatus(`Simulation complete: ${Object.values(arrivalsByBand).reduce((s,a)=>s+a.length,0)} arrivals`);
             Math.random = restoreRandom;
-            app.state.isSimulating = false;
+            state.isSimulating = false;
         }
     }
 
     processBatch();
 }
 
+// -----------------------------------------------------------------------------
+// UI + events
+// -----------------------------------------------------------------------------
+function setupEventListeners() {
 
-function animate() {
-    requestAnimationFrame(animate);
-
-    if (app.three.stats) {
-        app.three.stats.update();
-    }
-    if (app.three.controls) {
-        app.three.controls.update();
-    }
-    updateRendererSize();
-    if (app.three.renderer && app.three.scene && app.three.camera) {
-        app.three.renderer.render(app.three.scene, app.three.camera);
+    if (dom.useWebWorker) {
+        dom.useWebWorker.addEventListener('change', () => {
+            const enabled = dom.useWebWorker.checked;
+            setStatus(enabled ? 'Web Worker enabled' : 'Main thread mode');
+        });
     }
 
-    let smoothPeak = 0;
-    if (app.audio.amplitudeMeter) {
-        const peak = Math.sqrt(app.audio.amplitudeMeter.getPeak());
-        smoothPeak = app.audio.peakEnvelope ? app.audio.peakEnvelope.process(peak) : peak;
+    if (dom.realtimeSimToggle) {
+        dom.realtimeSimToggle.addEventListener('change', () => {
+            state.realtimeSimEnabled = dom.realtimeSimToggle.checked;
+            setStatus(state.realtimeSimEnabled ? 'Realtime preview enabled' : 'Realtime preview disabled');
+        });
     }
 
-    let smoothRMS = 0;
-    if (app.audio.amplitudeMeter) {
-        const rms = Math.sqrt(app.audio.amplitudeMeter.getRMS());
-        smoothRMS = app.audio.rmsEnvelope ? app.audio.rmsEnvelope.process(rms) : rms;
+    if (dom.downloadBtn) {
+        dom.downloadBtn.addEventListener('click', () => {
+            if (!impulseResponseBuffer) return;
+            const blob = audioBufferToWav(impulseResponseBuffer);
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.style.display = 'none';
+            a.href = url;
+            const seedValue = dom.randomSeed?.value ?? 'impulse-response';
+            a.download = `IR_${seedValue}.wav`;
+            document.body.appendChild(a);
+            a.click();
+            window.URL.revokeObjectURL(url);
+            document.body.removeChild(a);
+        });
     }
 
-    if (app.state.shaderMaterial) {
-        const finalUTime = performance.now() * 0.0001 * (1 + smoothPeak * 15);
-        app.state.shaderMaterial.uniforms.uTime.value = finalUTime;
+    document.querySelectorAll('input[type="range"]').forEach(slider => {
+        const display = document.getElementById(`${slider.id}-val`);
+        if (display) {
+            display.textContent = slider.value;
+            slider.addEventListener('input', () => { display.textContent = slider.value; });
+        }
+    });
+
+    if (dom.startButton) {
+        dom.startButton.addEventListener('click', () => {
+            if (!audioContext) {
+                console.warn('AudioContext not ready; cannot start simulation.');
+                return;
+            }
+            const useWebWorker = dom.useWebWorker?.checked ?? true;
+
+            if (useWebWorker && workerInstance) {
+                runSimulationWorker();
+            } else {
+                runSimulationMainThread();
+            }
+        });
+    }
+
+
+    if (dom.sampleAudioSelect) {
+        dom.sampleAudioSelect.addEventListener('change', () => {
+            if (dom.sampleAudioSelect.value) {
+                loadSelectedSample(dom.sampleAudioSelect.value);
+            }
+        });
+    }
+
+    if (dom.playSampleBtn) {
+    dom.playSampleBtn.addEventListener('click', () => {
+        if (!sampleBuffer) return;
+        if (sampleSourceNode) {
+            stopSamplePlayback();
+            return;
+        }
+        if (!audioContext) {
+            console.warn('AudioContext not ready yet.');
+            return;
+        }
+        
+        sampleSourceNode = audioContext.createBufferSource();
+        sampleSourceNode.buffer = sampleBuffer;
+        
+        // Connect to both dry and wet (convolver) paths
+        sampleSourceNode.connect(dryGain);
+        sampleSourceNode.connect(convolver);
+        
+        sampleSourceNode.start();
+        dom.playSampleBtn.textContent = 'Stop Sample';
+
+        setStatus('Playing sample…');
+
+        sampleSourceNode.onended = () => {
+            stopSamplePlayback();
+            setStatus('Sample finished.');
+        };
+    });
+    }
+
+    if (dom.stopSampleBtn) {
+        dom.stopSampleBtn.addEventListener('click', () => stopSamplePlayback());
+    }
+
+    let geometryNeedsWorkerUpdate = false;
+    let realtimeSimTimeout = null;
+
+    // Helper to mark geometry as needing worker update
+    function markGeometryForWorkerUpdate() {
+        geometryNeedsWorkerUpdate = true;
+    }
+
+    // Helper to send pending geometry update to worker
+    function sendPendingGeometryUpdate() {
+        if (geometryNeedsWorkerUpdate && workerInstance) {
+            updateWorkerGeometry();
+            geometryNeedsWorkerUpdate = false;
+        }
+
+        if (state.realtimeSimEnabled) {
+            clearTimeout(realtimeSimTimeout);
+            realtimeSimTimeout = setTimeout(() => {
+                runRealtimeSimulation();
+            }, 300);
+        }
+    }
+
+    if (dom.baseRadius) {
+        dom.baseRadius.addEventListener('input', () => {
+            rebuildRoom(); // Update visual immediately
+            markGeometryForWorkerUpdate();
+        });
+        dom.baseRadius.addEventListener('change', sendPendingGeometryUpdate);
+        dom.baseRadius.addEventListener('mouseup', sendPendingGeometryUpdate);
+        dom.baseRadius.addEventListener('touchend', sendPendingGeometryUpdate);
+    }
+    
+    if (dom.noiseFrequency) {
+        dom.noiseFrequency.addEventListener('input', () => {
+            rebuildRoom();
+            markGeometryForWorkerUpdate();
+        });
+        dom.noiseFrequency.addEventListener('change', sendPendingGeometryUpdate);
+        dom.noiseFrequency.addEventListener('mouseup', sendPendingGeometryUpdate);
+        dom.noiseFrequency.addEventListener('touchend', sendPendingGeometryUpdate);
+    }
+    
+    if (dom.noiseAmplitude) {
+        dom.noiseAmplitude.addEventListener('input', () => {
+            rebuildRoom();
+            markGeometryForWorkerUpdate();
+        });
+        dom.noiseAmplitude.addEventListener('change', sendPendingGeometryUpdate);
+        dom.noiseAmplitude.addEventListener('mouseup', sendPendingGeometryUpdate);
+        dom.noiseAmplitude.addEventListener('touchend', sendPendingGeometryUpdate);
+    }
+
+    if (dom.randomSeed) {
+        dom.randomSeed.addEventListener('change', () => {
+            applySeed(dom.randomSeed.value);
+            rebuildRoom();
+            if (workerInstance) {
+                updateWorkerGeometry();
+            }
+            if (state.realtimeSimEnabled) {
+                setTimeout(() => runRealtimeSimulation(), 300);
+            }
+        });
+    }
+
+    if (dom.randomizeSeedBtn && dom.randomSeed) {
+        dom.randomizeSeedBtn.addEventListener('click', () => {
+            dom.randomSeed.value = (Date.now() * Math.random()).toString(36).substr(2, 9);
+            applySeed(dom.randomSeed.value);
+            rebuildRoom();
+            // Immediate update for seed changes
+            if (workerInstance) {
+                updateWorkerGeometry();
+            }
+            if (state.realtimeSimEnabled) {
+                setTimeout(() => runRealtimeSimulation(), 300);
+            }
+        });
     }
 }
 
-function updateSectionState(section, trigger, expanded) {
-    if (!section || !trigger) return;
-    section.classList.toggle('is-open', expanded);
-    section.classList.toggle('collapsed', !expanded);
-    trigger.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+function setupLogSliders() {
+    if (dom.drySlider && dom.dryOutput) {
+        drySliderCtrl = initLogSlider({
+            sliderEl: dom.drySlider,
+            outputEl: dom.dryOutput,
+            minDb: -60,
+            maxDb: 12,
+            defaultDb: 0
+        });
+        
+        dom.drySlider.addEventListener('input', () => {
+            if (dryGain && drySliderCtrl) {
+                const db = drySliderCtrl.getDb();
+                dryGain.gain.value = dbToLinear(db);
+                console.log('Dry gain set to', dryGain.gain.value, 'from', db, 'dB');
+            }
+        });
+    }
+    
+    if (dom.wetSlider && dom.wetOutput) {
+        wetSliderCtrl = initLogSlider({
+            sliderEl: dom.wetSlider,
+            outputEl: dom.wetOutput,
+            minDb: -60,
+            maxDb: 12,
+            defaultDb: -6
+        });
+        
+        dom.wetSlider.addEventListener('input', () => {
+            if (wetGain && wetSliderCtrl) {
+                const db = wetSliderCtrl.getDb();
+                wetGain.gain.value = dbToLinear(db);
+                console.log('Wet gain set to', wetGain.gain.value, 'from', db, 'dB');
+            }
+        });
+    }
 }
+
 
 function setupCollapsibleSections() {
     const triggers = document.querySelectorAll('.section-toggle');
@@ -1172,35 +1420,152 @@ function setupCollapsibleSections() {
     });
 }
 
-setupCollapsibleSections();
-
-init();
-
-if (app.dom.randomSeed) {
-    app.dom.randomSeed.addEventListener('change', () => {
-        applySeed(app.dom.randomSeed.value);
-        rebuildRoom();
-    });
+function updateSectionState(section, trigger, expanded) {
+    section.classList.toggle('is-open', expanded);
+    section.classList.toggle('collapsed', !expanded);
+    trigger.setAttribute('aria-expanded', expanded ? 'true' : 'false');
 }
 
-// Cleanup worker on page unload
-window.addEventListener('beforeunload', () => {
-    if (app.worker.instance) {
-        app.worker.instance.terminate();
-    }
-});
-
-document.addEventListener('DOMContentLoaded', () => {
+function setupSplash() {
     const splash = document.getElementById('splashScreen');
     const enterBtn = document.getElementById('enterAppBtn');
-
     if (!splash || !enterBtn) return;
 
     enterBtn.addEventListener('click', async () => {
-        if (app.audio.context?.state === 'suspended') {
-            await app.audio.context.resume();
-        }
+        if (audioContext?.state === 'suspended') await audioContext.resume();
         await startApp();
         splash.classList.add('hidden');
     });
-});
+}
+
+// -----------------------------------------------------------------------------
+// Lifecycle
+// -----------------------------------------------------------------------------
+async function init() {
+    if (state.initialized) return;
+
+    cacheDom();
+    setupScene();
+    setupLogSliders();
+    setupEventListeners();
+    setupCollapsibleSections();
+    setupSplash();
+
+    await initShader();
+    applySeed(dom.randomSeed?.value);
+    buildRoomGeometry(); // Build geometry but DON'T send to worker yet
+    initWorker(); // Worker will call updateWorkerGeometry() when ready
+    await populateSampleDropdown();
+
+    animate();
+    state.initialized = true;
+}
+
+async function startApp() {
+    if (!state.initialized) await init();
+    
+    initAudioContext();
+    
+    if (audioContext && audioContext.state === 'suspended') {
+        await audioContext.resume();
+    }
+
+    if (window._pendingSampleBuffer && audioContext) {
+        try {
+            sampleBuffer = await audioContext.decodeAudioData(window._pendingSampleBuffer);
+            delete window._pendingSampleBuffer;
+            if (dom.playSampleBtn) dom.playSampleBtn.disabled = false;
+            setStatus('Sample ready');
+        } catch (err) {
+            console.error('Failed to decode pending sample:', err);
+        }
+    }
+
+    // Run initial realtime simulation after geometry is ready
+    if (state.workerGeometryReady || !workerInstance) {
+        runInitialSimulation();
+    } else {
+        // Wait for worker geometry to be ready
+        const checkGeometry = setInterval(() => {
+            if (state.workerGeometryReady) {
+                clearInterval(checkGeometry);
+                runInitialSimulation();
+            }
+        }, 100);
+        
+        // Timeout after 5 seconds
+        setTimeout(() => {
+            clearInterval(checkGeometry);
+            if (!state.workerGeometryReady) {
+                console.warn('Geometry not ready in time, running main thread simulation');
+                runInitialSimulation();
+            }
+        }, 5000);
+    }
+}
+
+function runInitialSimulation() {
+    setStatus('Generating initial impulse response...');
+    
+    const useWebWorker = dom.useWebWorker?.checked ?? true;
+    const initialParams = {
+        numRays: 2000, // Quick but decent quality
+        absorptionCoeffs: {
+            200: getNumericInputValue('absorption200', 0.1),
+            800: getNumericInputValue('absorption800', 0.15),
+            3200: getNumericInputValue('absorption3200', 0.2),
+            10000: getNumericInputValue('absorption10000', 0.25)
+        },
+        freqBands: CONFIG.FREQ_BANDS,
+        seed: dom.randomSeed?.value ?? '',
+        speedOfSound: CONFIG.SPEED_OF_SOUND,
+        maxBounces: state.maxBounces,
+        batchSize: 5000
+    };
+
+    if (useWebWorker && workerInstance && state.workerGeometryReady) {
+        state.isSimulating = true;
+        workerInstance.postMessage({
+            type: 'simulate',
+            data: initialParams
+        });
+    } else {
+        runQuickMainThreadSimulation(initialParams);
+    }
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    if (stats) stats.update();
+    if (controls) controls.update();
+    updateRendererSize();
+    if (renderer && scene && camera) renderer.render(scene, camera);
+
+    if (amplitudeMeter && peakEnvelope && rmsEnvelope && state.shaderMaterial) {
+        const peak = Math.sqrt(amplitudeMeter.getPeak());
+        const smoothPeak = peakEnvelope.process(peak);
+        const rms = Math.sqrt(amplitudeMeter.getRMS());
+        rmsEnvelope.process(rms);
+
+        state.shaderMaterial.uniforms.uTime.value = performance.now() * 0.0001 * (1 + smoothPeak * 15);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Cleanup
+// -----------------------------------------------------------------------------
+function cleanup() {
+    if (workerInstance) workerInstance.terminate();
+}
+
+// -----------------------------------------------------------------------------
+// Bootstrap
+// -----------------------------------------------------------------------------
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+} else {
+    init();
+}
+
+window.addEventListener('beforeunload', cleanup);
