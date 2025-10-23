@@ -1054,27 +1054,9 @@ function plotImpulseResponse(arrivals) {
         ? arrivals.map(arr => ({ ...arr, amplitude: (arr.amplitude / maxAbsAmplitude) * headroom }))
         : arrivals;
 
-    impulseResponseBuffer = createIRAudioBuffer(normalizedArrivals);
-    rawImpulseResponseBuffer = impulseResponseBuffer;
-    if (dom.irStretchOutput) dom.irStretchOutput.textContent = formatStretchLabel(parseFloat(dom.irStretchSlider?.value ?? '1') || 1);
-
-    if (impulseResponseBuffer) {
-        if (convolver) convolver.buffer = impulseResponseBuffer;
-        if (dom.downloadBtn) dom.downloadBtn.disabled = false;
-        scheduleImpulseResponseStretch(true, 'simulation');
-
-        if (!wavesurfer) wavesurfer = initWaveSurfer();
-        if (wavesurfer) {
-            const blob = audioBufferToWav(impulseResponseBuffer);
-            if (blob) {
-                const objectUrl = URL.createObjectURL(blob);
-                wavesurfer.load(objectUrl);
-                wavesurfer.load(URL.createObjectURL(blob));
-            } else {
-                console.error('Failed to create WAV blob from AudioBuffer');
-            }
-        }
-    }
+    const baseBuffer = createIRAudioBuffer(normalizedArrivals);
+    originalImpulseResponseBuffer = baseBuffer;
+    rebuildImpulseResponseFromSource('simulation', true);
 }
 
 async function bandpassIRBuffer(irBuffer, centerFreq, Q = 1) {
@@ -1181,24 +1163,11 @@ async function plotMultiBandImpulseResponse(arrivalsByBand, freqBands) {
     }
 
     // Combine frequency bands into single IR using filterbank
-    impulseResponseBuffer = combineFrequencyBands(irBuffers, freqBands);
-    rawImpulseResponseBuffer = impulseResponseBuffer;
-
-    if (impulseResponseBuffer) {
-        if (convolver) convolver.buffer = impulseResponseBuffer;
-        if (dom.downloadBtn) dom.downloadBtn.disabled = false;
+    const combinedBuffer = combineFrequencyBands(irBuffers, freqBands);
+    originalImpulseResponseBuffer = combinedBuffer;
+    if (combinedBuffer) {
         setStatus('Multi-band Impulse Response loaded!');
-        scheduleImpulseResponseStretch(true, 'simulation');
-
-        if (!wavesurfer) wavesurfer = initWaveSurfer();
-        if (wavesurfer) {
-            const blob = audioBufferToWav(impulseResponseBuffer);
-            if (blob) {
-                const objectUrl = URL.createObjectURL(blob);
-                wavesurfer.load(objectUrl);
-                wavesurfer.once('ready', () => URL.revokeObjectURL(objectUrl));
-            }
-        }
+        rebuildImpulseResponseFromSource('simulation', true);
     }
 }
 
@@ -1467,6 +1436,56 @@ function formatStretchLabel(value) {
     return `${value.toFixed(2)}×`;
 }
 
+function formatPreDelayLabel(valueMs) {
+    return `${Math.max(0, valueMs).toFixed(0)} ms`;
+}
+
+function getPreDelayMilliseconds() {
+    const defaultValue = CONFIG.DEFAULTS?.irPreDelayMs ?? 0;
+    const sliderValue = parseFloat(dom.irPreDelaySlider?.value ?? `${defaultValue}`);
+    if (Number.isNaN(sliderValue)) return defaultValue;
+    return Math.max(0, sliderValue);
+}
+
+function applyPreDelayToBuffer(sourceBuffer, preDelayMs) {
+    if (!sourceBuffer) return null;
+    initAudioContext();
+
+    const sampleRate = sourceBuffer.sampleRate;
+    const offsetSamples = Math.round((preDelayMs / 1000) * sampleRate);
+    if (offsetSamples <= 0) return sourceBuffer;
+
+    if (offsetSamples >= sourceBuffer.length) {
+        return audioContext.createBuffer(sourceBuffer.numberOfChannels, 1, sampleRate);
+    }
+
+    const trimmedLength = sourceBuffer.length - offsetSamples;
+    const trimmedBuffer = audioContext.createBuffer(
+        sourceBuffer.numberOfChannels,
+        trimmedLength,
+        sampleRate
+    );
+
+    for (let channel = 0; channel < sourceBuffer.numberOfChannels; channel++) {
+        const srcData = sourceBuffer.getChannelData(channel);
+        const destData = trimmedBuffer.getChannelData(channel);
+        destData.set(srcData.subarray(offsetSamples, offsetSamples + trimmedLength));
+    }
+
+    return trimmedBuffer;
+}
+
+function rebuildImpulseResponseFromSource(reason = null, immediateStretch = true) {
+    if (!originalImpulseResponseBuffer) return;
+    const preDelayMs = getPreDelayMilliseconds();
+    if (dom.irPreDelayOutput) dom.irPreDelayOutput.textContent = formatPreDelayLabel(preDelayMs);
+
+    rawImpulseResponseBuffer = applyPreDelayToBuffer(originalImpulseResponseBuffer, preDelayMs);
+    if (!rawImpulseResponseBuffer) return;
+
+    scheduleImpulseResponseStretch(immediateStretch, reason);
+}
+
 function scheduleImpulseResponseStretch(immediate = false, reason = null) {
     if (!rawImpulseResponseBuffer) return;
     const trigger = () => {
@@ -1532,6 +1551,10 @@ async function applyImpulseResponseStretch(taskId, reason = null) {
         setStatus('Impulse Response loaded! Ready for auralization.');
     } else if (reason === 'slider') {
         setStatus(`IR stretch updated (${formatStretchLabel(sliderValue)}).`);
+    } else if (reason === 'preDelay') {
+        setStatus(`IR pre-delay trimmed (${formatPreDelayLabel(getPreDelayMilliseconds())}).`);
+    } else if (reason === 'reset') {
+        setStatus('Impulse response settings reset.');
     }
 }
 
@@ -1665,6 +1688,11 @@ function resetControlsToDefaults() {
         dom.irStretchSlider.value = '1';
         document.querySelectorAll('#irStretch-val').forEach(el => el.textContent = formatStretchLabel(1));
     }
+    if (dom.irPreDelaySlider) {
+        const defaultPreDelay = defaults.irPreDelayMs ?? 0;
+        dom.irPreDelaySlider.value = `${defaultPreDelay}`;
+        document.querySelectorAll('#irPreDelay-val').forEach(el => el.textContent = formatPreDelayLabel(defaultPreDelay));
+    }
     pitchedSampleBuffer = sampleBuffer || null;
 
     applySeed(defaults.randomSeed);
@@ -1677,7 +1705,7 @@ function resetControlsToDefaults() {
     }
 
     scheduleSamplePitchUpdate(true, 'reset');
-    scheduleImpulseResponseStretch(true, 'reset');
+    rebuildImpulseResponseFromSource('reset', true);
 }
 
 function runSimulationWorker() {
@@ -2073,10 +2101,29 @@ function setupEventListeners() {
     if (dom.irStretchSlider) {
         const outputs = document.querySelectorAll('#irStretch-val');
         outputs.forEach(el => el.textContent = formatStretchLabel(parseFloat(dom.irStretchSlider.value || '1')));
-        dom.irStretchSlider.addEventListener('input', () => {
+        dom.irStretchSlider.addEventListener('input', (event) => {
+            event.stopImmediatePropagation();
             const value = parseFloat(dom.irStretchSlider.value || '1');
             outputs.forEach(el => el.textContent = formatStretchLabel(value));
             scheduleImpulseResponseStretch(false, 'slider');
+        });
+    }
+
+    if (dom.irPreDelaySlider) {
+        const outputs = document.querySelectorAll('#irPreDelay-val');
+        const updateLabel = () => {
+            const value = getPreDelayMilliseconds();
+            outputs.forEach(el => el.textContent = formatPreDelayLabel(value));
+        };
+        updateLabel();
+        dom.irPreDelaySlider.addEventListener('input', (event) => {
+            event.stopImmediatePropagation();
+            updateLabel();
+        });
+        dom.irPreDelaySlider.addEventListener('change', (event) => {
+            event.stopImmediatePropagation();
+            updateLabel();
+            rebuildImpulseResponseFromSource('preDelay', true);
         });
     }
 
@@ -2105,10 +2152,10 @@ function setupEventListeners() {
 
     document.querySelectorAll('input[type="range"]').forEach(slider => {
         const display = document.getElementById(`${slider.id}-val`);
-        if (display) {
-            display.textContent = slider.value;
-            slider.addEventListener('input', () => { display.textContent = slider.value; });
-        }
+        if (!display) return;
+        if (slider.id === 'irStretch' || slider.id === 'irPreDelay') return;
+        display.textContent = slider.value;
+        slider.addEventListener('input', () => { display.textContent = slider.value; });
     });
 
     if (dom.startButton) {
