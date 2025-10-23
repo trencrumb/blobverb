@@ -211,7 +211,7 @@ async function processWithRubberBand(audioBuffer, { timeRatio = 1, pitchSemitone
     initAudioContext();
     const ctx = audioContext;
 
-    const clampedRatio = Math.max(0.25, Math.min(timeRatio, 4.0));
+    const clampedRatio = Math.max(0.1, Math.min(timeRatio, 10.0));
     const pitchScale = Math.pow(2, pitchSemitones / 12);
 
     const rbState = rbApi.rubberband_new(sampleRate, channels, RUBBERBAND_OPTIONS, 1, 1);
@@ -1065,7 +1065,7 @@ function plotImpulseResponse(arrivals) {
             if (blob) {
                 const objectUrl = URL.createObjectURL(blob);
                 wavesurfer.load(objectUrl);
-                wavesurfer.once('ready', () => URL.revokeObjectURL(objectUrl));
+                wavesurfer.load(URL.createObjectURL(blob));
             } else {
                 console.error('Failed to create WAV blob from AudioBuffer');
             }
