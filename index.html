@@ -27,12 +27,12 @@
 
             <div id="controlPanel" class="panel">
                 <section class="panel-section is-open" data-section="about">
-                    <button class="section-toggle" type="button" aria-expanded="true">
+                    <button class="section-toggle" type="button" aria-expanded="false">
                         <span>About</span>
                         <span class="toggle-icon" aria-hidden="true"></span>
                     </button>
                     <div class="section-body">
-                        <p>Uses physically based techniques to create reverb from 3D shapes, using ray-tracing for the early reflections and ray-radiosity for the late reverberations.</p>
+                        <p>Uses physically based techniques to create reverb from 3D shapes, using ray-tracing to calculate the early reflections and ray-radiosity for the late reverberations of a impulse response, which is then convolved with the input audio.</p>
                         <p>Once the impulse response is synthesized you can audition it immediately with the built-in samples or upload your own dry audio, then download the IR for use in any convolution reverb.</p>
                         <p>Under the hood: <strong>Three.js</strong> renders the scene, <strong>three-mesh-bvh</strong> accelerates ray intersections, <strong>WaveSurfer.js</strong> hosts the IR preview, <strong>WEQ8</strong> shapes the mix, and <strong>Rubber Band WASM</strong> drives the stretch/pitch tools.</p>
                         <p>Designed and built by <a href="https://kyle-ramsey.com" target="_blank" rel="noopener">Kyle Ramsey</a>. Source code and latest updates live on <a href="https://github.com/kyle-ramsey/blobverb" target="_blank" rel="noopener">GitHub</a>.</p>
@@ -49,6 +49,7 @@
                             <li>As you move the parameters, quick simulations of around 3000 rays will be run to give you immediate feedback.</li>
                             <li>However, for the final, better quality simulation, please click the "Simulate Acoustics" button below.</li>
                             <li>This will run the ray tracing simulation. This may take a few moments.</li>
+                            <li>Click on the waveform in the bottom right corner to hear the impulse response, press Play sample in the bottom left corner to hear your input sound in the convolution reverb</li>
                             <li>Once the simulation is complete, you can play sample audio or upload your own dry audio file to hear it convolved with the generated impulse response.</li>
                             <li>You can also download the generated impulse response as a .wav file for use in other audio software.</li>
                         </ol>
@@ -137,8 +138,8 @@
                                 </label>
                             </div>
                             <div class="control-group">
-                                <label for="rrScattering">Scattering Mix <span id="rrScattering-val">0.45</span></label>
-                                <input type="range" id="rrScattering" min="0" max="0.5" step="0.05" value="0.45">
+                                <label for="rrScattering">Scattering Mix <span id="rrScattering-val">0.3</span></label>
+                                <input type="range" id="rrScattering" min="0" max="0.4" step="0.05" value="0.3">
                             </div>
                             <div class="control-group">
                                 <label for="rrHistogramResolution">Histogram Bin <span id="rrHistogramResolution-val">0.0030 s</span></label>
@@ -164,10 +165,6 @@
                                 <label for="rrMinEnergy">Min Energy <span id="rrMinEnergy-val">1.0e-9</span></label>
                                 <input type="number" id="rrMinEnergy" min="1e-12" max="0.001" step="1e-9" value="1e-9">
                             </div>
-                        </fieldset>
-                        <fieldset>
-                            <legend>Audio Manipulation</legend>
-
                         </fieldset>
                     </div>
                 </section>
@@ -218,10 +215,14 @@
                     <div class="auralization-card eq-column">
                         <weq8-ui />
                     </div>
-                    <div class="auralization-card waveform-column">
+                            <div class="auralization-card waveform-column">
                             <div class="control-group">
                                 <label for="irStretch">Stretch <span id="irStretch-val">1.00×</span></label>
                                 <input type="range" id="irStretch" min="0.1" max="10.0" step="0.05" value="1">
+                            </div>
+                            <div class="control-group">
+                                <label for="irPreDelay">Pre-Delay Trim <span id="irPreDelay-val">0 ms</span></label>
+                                <input type="range" id="irPreDelay" min="0" max="200" step="1" value="0">
                             </div>
                         <div id="waveform"></div>
                         <button id="downloadBtn" type="button" disabled>Download IR (.wav)</button>

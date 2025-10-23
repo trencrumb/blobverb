@@ -37,7 +37,7 @@ const CONFIG = {
     EMITTER_RADIUS: 0.5,
     RAY_RADIOSITY: {
         enabled: true,
-        scatteringCoeff: 0.45,
+        scatteringCoeff: 0.3,
         histogramResolution: 0.003,
         maxTime: 6.0,
         hybridBounceThreshold: 3,
@@ -59,6 +59,7 @@ const CONFIG = {
         numRays: 15000,
         useWebWorker: true,
         realtimePreview: true,
+        irPreDelayMs: 0,
         rayRadiosity: {
             enabled: true,
             scatteringCoeff: 0.45,
@@ -334,6 +335,7 @@ let rmsEnvelope;
 let peakEnvelope;
 let impulseResponseBuffer;
 let rawImpulseResponseBuffer;
+let originalImpulseResponseBuffer;
 let impulseResponseSource;
 let sampleBuffer;
 let pitchedSampleBuffer;
@@ -377,6 +379,8 @@ function cacheDom() {
         samplePitchOutput: document.getElementById('samplePitch-val'),
         irStretchSlider: document.getElementById('irStretch'),
         irStretchOutput: document.getElementById('irStretch-val'),
+        irPreDelaySlider: document.getElementById('irPreDelay'),
+        irPreDelayOutput: document.getElementById('irPreDelay-val'),
         useWebWorker: document.getElementById('useWebWorker'), 
         realtimeSimToggle: document.getElementById('realtimeSimToggle'),
         rrEnabled: document.getElementById('rrEnabled'),
@@ -2049,8 +2053,7 @@ function setupEventListeners() {
         document.getElementById('absorption10000')
     ].filter(Boolean);
     realtimeInputs.forEach(input => {
-        const evt = input.type === 'range' ? 'input' : 'change';
-        input.addEventListener(evt, () => {
+        input.addEventListener('change', () => {
             if (state.realtimeSimEnabled && !state.isSimulating) {
                 runRealtimeSimulation();
             }
