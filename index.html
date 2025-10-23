@@ -34,6 +34,7 @@
                     <div class="section-body">
                         <p>Uses physically based techniques to create reverb from 3D shapes, using ray-tracing for the early reflections and ray-radiosity for the late reverberations.</p>
                         <p>Once the impulse response is synthesized you can audition it immediately with the built-in samples or upload your own dry audio, then download the IR for use in any convolution reverb.</p>
+                        <p>Under the hood: <strong>Three.js</strong> renders the scene, <strong>three-mesh-bvh</strong> accelerates ray intersections, <strong>WaveSurfer.js</strong> hosts the IR preview, <strong>WEQ8</strong> shapes the mix, and <strong>Rubber Band WASM</strong> drives the stretch/pitch tools.</p>
                         <p>Designed and built by <a href="https://kyle-ramsey.com" target="_blank" rel="noopener">Kyle Ramsey</a>. Source code and latest updates live on <a href="https://github.com/kyle-ramsey/blobverb" target="_blank" rel="noopener">GitHub</a>.</p>
                     </div>
                 </section>
@@ -136,33 +137,37 @@
                                 </label>
                             </div>
                             <div class="control-group">
-                                <label for="rrScattering">Scattering Mix <span id="rrScattering-val">0.40</span></label>
-                                <input type="range" id="rrScattering" min="0" max="0.5" step="0.05" value="0.3">
+                                <label for="rrScattering">Scattering Mix <span id="rrScattering-val">0.45</span></label>
+                                <input type="range" id="rrScattering" min="0" max="0.5" step="0.05" value="0.45">
                             </div>
                             <div class="control-group">
-                                <label for="rrHistogramResolution">Histogram Bin <span id="rrHistogramResolution-val">0.0020 s</span></label>
-                                <input type="number" id="rrHistogramResolution" min="0.0001" max="0.01" step="0.0001" value="0.002">
+                                <label for="rrHistogramResolution">Histogram Bin <span id="rrHistogramResolution-val">0.0030 s</span></label>
+                                <input type="number" id="rrHistogramResolution" min="0.0001" max="0.01" step="0.0001" value="0.003">
                             </div>
                             <div class="control-group">
-                                <label for="rrMaxTime">Tail Duration <span id="rrMaxTime-val">4.50 s</span></label>
-                                <input type="number" id="rrMaxTime" min="3" max="20" step="0.5" value="4.5">
+                                <label for="rrMaxTime">Tail Duration <span id="rrMaxTime-val">6.00 s</span></label>
+                                <input type="number" id="rrMaxTime" min="3" max="20" step="0.5" value="6">
                             </div>
                             <div class="control-group">
                                 <label for="rrHybridBounce">Hybrid Bounces <span id="rrHybridBounce-val">3</span></label>
                                 <input type="number" id="rrHybridBounce" min="2" max="5" step="1" value="3">
                             </div>
                             <div class="control-group">
-                                <label for="rrPoissonDensity">Pulse Density <span id="rrPoissonDensity-val">18.0</span></label>
-                                <input type="number" id="rrPoissonDensity" min="8" max="24" step="1" value="18">
+                                <label for="rrPoissonDensity">Pulse Density <span id="rrPoissonDensity-val">22.0</span></label>
+                                <input type="number" id="rrPoissonDensity" min="8" max="24" step="1" value="22">
                             </div>
                             <div class="control-group">
-                                <label for="rrDiffuseGain">Diffuse Gain <span id="rrDiffuseGain-val">1.30</span></label>
-                                <input type="number" id="rrDiffuseGain" min="0.8" max="2.0" step="0.1" value="1.3">
+                                <label for="rrDiffuseGain">Diffuse Gain <span id="rrDiffuseGain-val">1.60</span></label>
+                                <input type="number" id="rrDiffuseGain" min="0.8" max="2.0" step="0.1" value="1.6">
                             </div>
                             <div class="control-group">
-                                <label for="rrMinEnergy">Min Energy <span id="rrMinEnergy-val">1e-8.0</span></label>
-                                <input type="number" id="rrMinEnergy" min="1e-12" max="0.001" step="1e-9" value="1e-8">
+                                <label for="rrMinEnergy">Min Energy <span id="rrMinEnergy-val">1.0e-9</span></label>
+                                <input type="number" id="rrMinEnergy" min="1e-12" max="0.001" step="1e-9" value="1e-9">
                             </div>
+                        </fieldset>
+                        <fieldset>
+                            <legend>Audio Manipulation</legend>
+
                         </fieldset>
                     </div>
                 </section>
@@ -204,12 +209,20 @@
                                 <output for="wet-slider" id="wet-output">0.0 dB</output>
                                 <input type="range" id="wet-slider" min="0" max="1000" step="1">
                             </div>
+                            <div class="control-group">
+                                <label for="samplePitch">Sample Pitch <span id="samplePitch-val">0 st</span></label>
+                                <input type="range" id="samplePitch" min="-12" max="12" step="1" value="0">
+                            </div>
                         </fieldset>
                     </div>
                     <div class="auralization-card eq-column">
                         <weq8-ui />
                     </div>
                     <div class="auralization-card waveform-column">
+                            <div class="control-group">
+                                <label for="irStretch">Stretch <span id="irStretch-val">1.00×</span></label>
+                                <input type="range" id="irStretch" min="0.1" max="10.0" step="0.05" value="1">
+                            </div>
                         <div id="waveform"></div>
                         <button id="downloadBtn" type="button" disabled>Download IR (.wav)</button>
                     </div>

@@ -15,6 +15,8 @@ import { createNoise3D } from 'simplex-noise';
 import seedrandom from 'seedrandom';
 import { WEQ8Runtime } from 'weq8';
 import 'weq8/ui';
+import { RubberBandInterface, RubberBandOption } from '@slangeder/rubberband-wasm/dist/index.esm.js';
+import rubberbandWasmUrl from '@slangeder/rubberband-wasm/dist/rubberband.wasm?url';
 
 import noise3DGLSL from './shaders/noise3D.glsl?raw';
 import vertexSrc from './shaders/vertex.glsl?raw';
@@ -174,6 +176,151 @@ function synthesizeRadiosityPulses(histogram, binSize, poissonDensity, minEnergy
     return pulses;
 }
 
+// -----------------------------------------------------------------------------
+// Rubber Band helpers
+// -----------------------------------------------------------------------------
+const RUBBERBAND_OPTIONS =
+    RubberBandOption.RubberBandOptionProcessOffline |
+    RubberBandOption.RubberBandOptionStretchPrecise |
+    RubberBandOption.RubberBandOptionTransientsSmooth |
+    RubberBandOption.RubberBandOptionFormantPreserved |
+    RubberBandOption.RubberBandOptionPitchHighQuality |
+    RubberBandOption.RubberBandOptionChannelsTogether;
+
+async function ensureRubberBandInstance() {
+    if (!rubberBandInstancePromise) {
+        rubberBandInstancePromise = (async () => {
+            const response = await fetch(rubberbandWasmUrl);
+            const wasmBytes = await response.arrayBuffer();
+            const module = await WebAssembly.compile(wasmBytes);
+            return RubberBandInterface.initialize(module);
+        })();
+    }
+    return rubberBandInstancePromise;
+}
+
+async function processWithRubberBand(audioBuffer, { timeRatio = 1, pitchSemitones = 0 } = {}) {
+    if (!audioBuffer) throw new Error('No audio buffer provided to Rubber Band processor.');
+    const rbApi = await ensureRubberBandInstance();
+
+    const channels = audioBuffer.numberOfChannels;
+    const sampleRate = audioBuffer.sampleRate;
+    const inputLength = audioBuffer.length;
+    if (channels === 0 || inputLength === 0) return audioBuffer;
+
+    initAudioContext();
+    const ctx = audioContext;
+
+    const clampedRatio = Math.max(0.25, Math.min(timeRatio, 4.0));
+    const pitchScale = Math.pow(2, pitchSemitones / 12);
+
+    const rbState = rbApi.rubberband_new(sampleRate, channels, RUBBERBAND_OPTIONS, 1, 1);
+    rbApi.rubberband_set_time_ratio(rbState, clampedRatio);
+    rbApi.rubberband_set_pitch_scale(rbState, pitchScale);
+    rbApi.rubberband_set_expected_input_duration(rbState, inputLength);
+
+    let samplesRequired = rbApi.rubberband_get_samples_required(rbState);
+    if (!Number.isFinite(samplesRequired) || samplesRequired <= 0) {
+        samplesRequired = 2048;
+    }
+
+    const channelArrayPtr = rbApi.malloc(channels * 4);
+    const channelDataPtrs = [];
+    const tempChunks = [];
+    for (let c = 0; c < channels; c++) {
+        const ptr = rbApi.malloc(samplesRequired * 4);
+        channelDataPtrs.push(ptr);
+        tempChunks.push(new Float32Array(samplesRequired));
+        rbApi.memWritePtr(channelArrayPtr + c * 4, ptr);
+    }
+
+    const inputChannelData = Array.from({ length: channels }, (_, idx) =>
+        Float32Array.from(audioBuffer.getChannelData(idx))
+    );
+
+    let outputCapacity = Math.max(1, Math.ceil(inputLength * Math.max(clampedRatio, 1)) + samplesRequired);
+    const outputChannels = Array.from({ length: channels }, () => new Float32Array(outputCapacity));
+    let writeIndex = 0;
+
+    const ensureCapacity = (additional) => {
+        if (writeIndex + additional <= outputCapacity) return;
+        const newCapacity = Math.max(writeIndex + additional, Math.ceil(outputCapacity * 1.5));
+        for (let c = 0; c < channels; c++) {
+            const expanded = new Float32Array(newCapacity);
+            expanded.set(outputChannels[c].subarray(0, writeIndex));
+            outputChannels[c] = expanded;
+        }
+        outputCapacity = newCapacity;
+    };
+
+    const writeChunkToMemory = (channelIndex, data, length) => {
+        if (length === samplesRequired) {
+            rbApi.memWrite(channelDataPtrs[channelIndex], data);
+        } else {
+            const temp = tempChunks[channelIndex];
+            temp.fill(0);
+            temp.set(data);
+            rbApi.memWrite(channelDataPtrs[channelIndex], temp);
+        }
+    };
+
+    const tryRetrieve = (final = false) => {
+        while (true) {
+            const available = rbApi.rubberband_available(rbState);
+            if (available < 1) break;
+            if (!final && available < samplesRequired) break;
+            const chunkSize = Math.min(samplesRequired, available);
+            ensureCapacity(chunkSize);
+            const received = rbApi.rubberband_retrieve(rbState, channelArrayPtr, chunkSize);
+            for (let c = 0; c < channels; c++) {
+                const chunk = rbApi.memReadF32(channelDataPtrs[c], received);
+                outputChannels[c].set(chunk, writeIndex);
+            }
+            writeIndex += received;
+        }
+    };
+
+    try {
+        let read = 0;
+        while (read < inputLength) {
+            const remaining = Math.min(samplesRequired, inputLength - read);
+            for (let c = 0; c < channels; c++) {
+                const chunk = inputChannelData[c].subarray(read, read + remaining);
+                writeChunkToMemory(c, chunk, chunk.length);
+            }
+            read += remaining;
+            const hasMore = read < inputLength ? 0 : 1;
+            rbApi.rubberband_study(rbState, channelArrayPtr, remaining, hasMore);
+        }
+
+        read = 0;
+        while (read < inputLength) {
+            const remaining = Math.min(samplesRequired, inputLength - read);
+            for (let c = 0; c < channels; c++) {
+                const chunk = inputChannelData[c].subarray(read, read + remaining);
+                writeChunkToMemory(c, chunk, chunk.length);
+            }
+            read += remaining;
+            const hasMore = read < inputLength ? 0 : 1;
+            rbApi.rubberband_process(rbState, channelArrayPtr, remaining, hasMore);
+            tryRetrieve(false);
+        }
+
+        tryRetrieve(true);
+
+        const outputLength = Math.max(1, writeIndex);
+        const finalBuffer = ctx.createBuffer(channels, outputLength, sampleRate);
+        for (let c = 0; c < channels; c++) {
+            finalBuffer.copyToChannel(outputChannels[c].subarray(0, outputLength), c);
+        }
+        return finalBuffer;
+    } finally {
+        channelDataPtrs.forEach((ptr) => rbApi.free(ptr));
+        rbApi.free(channelArrayPtr);
+        rbApi.rubberband_delete(rbState);
+    }
+}
+
 // Audio references
 let audioContext;
 let convolver;
@@ -186,11 +333,20 @@ let amplitudeMeter;
 let rmsEnvelope;
 let peakEnvelope;
 let impulseResponseBuffer;
+let rawImpulseResponseBuffer;
 let impulseResponseSource;
 let sampleBuffer;
+let pitchedSampleBuffer;
 let sampleSourceNode;
 let wavesurfer;
 let weq8Runtime;
+let rubberBandInstancePromise = null;
+let isIrStretchProcessing = false;
+let isSamplePitchProcessing = false;
+let irStretchTaskId = 0;
+let samplePitchTaskId = 0;
+let irStretchDebounce = null;
+let samplePitchDebounce = null;
 
 // Worker reference
 let workerInstance = null;
@@ -217,6 +373,10 @@ function cacheDom() {
         dryOutput: document.getElementById('dry-output'),
         wetSlider: document.getElementById('wet-slider'),
         wetOutput: document.getElementById('wet-output'),
+        samplePitchSlider: document.getElementById('samplePitch'),
+        samplePitchOutput: document.getElementById('samplePitch-val'),
+        irStretchSlider: document.getElementById('irStretch'),
+        irStretchOutput: document.getElementById('irStretch-val'),
         useWebWorker: document.getElementById('useWebWorker'), 
         realtimeSimToggle: document.getElementById('realtimeSimToggle'),
         rrEnabled: document.getElementById('rrEnabled'),
@@ -891,17 +1051,24 @@ function plotImpulseResponse(arrivals) {
         : arrivals;
 
     impulseResponseBuffer = createIRAudioBuffer(normalizedArrivals);
+    rawImpulseResponseBuffer = impulseResponseBuffer;
+    if (dom.irStretchOutput) dom.irStretchOutput.textContent = formatStretchLabel(parseFloat(dom.irStretchSlider?.value ?? '1') || 1);
 
-    if (impulseResponseBuffer && convolver) {
-        convolver.buffer = impulseResponseBuffer;
+    if (impulseResponseBuffer) {
+        if (convolver) convolver.buffer = impulseResponseBuffer;
         if (dom.downloadBtn) dom.downloadBtn.disabled = false;
-        setStatus('Impulse Response loaded! Ready for auralization.');
+        scheduleImpulseResponseStretch(true, 'simulation');
 
-        const blob = audioBufferToWav(impulseResponseBuffer);
-        if (blob) {
-            wavesurfer.load(URL.createObjectURL(blob));
-        } else {
-            console.error('Failed to create WAV blob from AudioBuffer');
+        if (!wavesurfer) wavesurfer = initWaveSurfer();
+        if (wavesurfer) {
+            const blob = audioBufferToWav(impulseResponseBuffer);
+            if (blob) {
+                const objectUrl = URL.createObjectURL(blob);
+                wavesurfer.load(objectUrl);
+                wavesurfer.once('ready', () => URL.revokeObjectURL(objectUrl));
+            } else {
+                console.error('Failed to create WAV blob from AudioBuffer');
+            }
         }
     }
 }
@@ -1011,15 +1178,22 @@ async function plotMultiBandImpulseResponse(arrivalsByBand, freqBands) {
 
     // Combine frequency bands into single IR using filterbank
     impulseResponseBuffer = combineFrequencyBands(irBuffers, freqBands);
+    rawImpulseResponseBuffer = impulseResponseBuffer;
 
-    if (impulseResponseBuffer && convolver) {
-        convolver.buffer = impulseResponseBuffer;
+    if (impulseResponseBuffer) {
+        if (convolver) convolver.buffer = impulseResponseBuffer;
         if (dom.downloadBtn) dom.downloadBtn.disabled = false;
         setStatus('Multi-band Impulse Response loaded!');
+        scheduleImpulseResponseStretch(true, 'simulation');
 
-        const blob = audioBufferToWav(impulseResponseBuffer);
-        if (blob) {
-            wavesurfer.load(URL.createObjectURL(blob));
+        if (!wavesurfer) wavesurfer = initWaveSurfer();
+        if (wavesurfer) {
+            const blob = audioBufferToWav(impulseResponseBuffer);
+            if (blob) {
+                const objectUrl = URL.createObjectURL(blob);
+                wavesurfer.load(objectUrl);
+                wavesurfer.once('ready', () => URL.revokeObjectURL(objectUrl));
+            }
         }
     }
 }
@@ -1162,6 +1336,8 @@ async function loadSelectedSample(url) {
         
         if (audioContext) {
             sampleBuffer = await audioContext.decodeAudioData(arrayBuffer);
+            pitchedSampleBuffer = sampleBuffer;
+            scheduleSamplePitchUpdate(true, 'load');
             setStatus(`Sample ready: ${url.split('/').pop()}`);
             if (dom.playSampleBtn) dom.playSampleBtn.disabled = false;
         } else {
@@ -1277,6 +1453,148 @@ function updateRayRadiosityOutputs() {
     if (dom.rrMinEnergyOutput) dom.rrMinEnergyOutput.textContent = cfg.minEnergyThreshold.toExponential(1);
 }
 
+function formatPitchLabel(value) {
+    const rounded = Math.round(value);
+    const prefix = rounded > 0 ? '+' : '';
+    return `${prefix}${rounded} st`;
+}
+
+function formatStretchLabel(value) {
+    return `${value.toFixed(2)}×`;
+}
+
+function scheduleImpulseResponseStretch(immediate = false, reason = null) {
+    if (!rawImpulseResponseBuffer) return;
+    const trigger = () => {
+        const taskId = ++irStretchTaskId;
+        applyImpulseResponseStretch(taskId, reason).catch((error) => {
+            console.error('IR stretch failed:', error);
+        });
+    };
+    if (immediate) {
+        trigger();
+    } else {
+        if (irStretchDebounce) clearTimeout(irStretchDebounce);
+        irStretchDebounce = setTimeout(trigger, 200);
+    }
+}
+
+async function applyImpulseResponseStretch(taskId, reason = null) {
+    if (!rawImpulseResponseBuffer) return;
+    const sliderValue = parseFloat(dom.irStretchSlider?.value ?? '1') || 1;
+    const needsStretch = Math.abs(sliderValue - 1) > 1e-3;
+
+    let processed = rawImpulseResponseBuffer;
+    if (needsStretch) {
+        if (isIrStretchProcessing) {
+            setTimeout(() => {
+                if (taskId === irStretchTaskId) {
+                    applyImpulseResponseStretch(taskId, reason).catch((error) => console.error('IR stretch retry failed:', error));
+                }
+            }, 120);
+            return;
+        }
+        isIrStretchProcessing = true;
+        try {
+            processed = await processWithRubberBand(rawImpulseResponseBuffer, { timeRatio: sliderValue });
+        } catch (error) {
+            console.error('Error stretching impulse response:', error);
+            processed = rawImpulseResponseBuffer;
+            if (reason === 'slider') {
+                setStatus('IR stretch failed; using original response.');
+            }
+        } finally {
+            isIrStretchProcessing = false;
+        }
+    }
+
+    if (taskId !== irStretchTaskId) return;
+
+    impulseResponseBuffer = processed;
+    if (convolver) convolver.buffer = impulseResponseBuffer;
+    if (dom.downloadBtn) dom.downloadBtn.disabled = false;
+
+    if (!wavesurfer) wavesurfer = initWaveSurfer();
+    if (wavesurfer) {
+        const blob = audioBufferToWav(impulseResponseBuffer);
+        if (blob) {
+            const objectUrl = URL.createObjectURL(blob);
+            wavesurfer.load(objectUrl);
+            wavesurfer.once('ready', () => URL.revokeObjectURL(objectUrl));
+        }
+    }
+
+    if (reason === 'simulation') {
+        setStatus('Impulse Response loaded! Ready for auralization.');
+    } else if (reason === 'slider') {
+        setStatus(`IR stretch updated (${formatStretchLabel(sliderValue)}).`);
+    }
+}
+
+function scheduleSamplePitchUpdate(immediate = false, reason = null) {
+    if (!sampleBuffer) return;
+    const trigger = () => {
+        const taskId = ++samplePitchTaskId;
+        applySamplePitch(taskId, reason).catch((error) => {
+            console.error('Sample pitch processing failed:', error);
+        });
+    };
+    if (immediate) {
+        trigger();
+    } else {
+        if (samplePitchDebounce) clearTimeout(samplePitchDebounce);
+        samplePitchDebounce = setTimeout(trigger, 150);
+    }
+}
+
+async function applySamplePitch(taskId, reason = null) {
+    if (!sampleBuffer) return;
+
+    const semitones = parseFloat(dom.samplePitchSlider?.value ?? '0') || 0;
+    const needsProcessing = Math.abs(semitones) > 1e-3;
+
+    if (sampleSourceNode) stopSamplePlayback();
+
+    if (!needsProcessing) {
+        pitchedSampleBuffer = sampleBuffer;
+        if (reason === 'slider') {
+            setStatus('Sample pitch reset.');
+        }
+        return;
+    }
+
+    if (isSamplePitchProcessing) {
+        setTimeout(() => {
+            if (taskId === samplePitchTaskId) {
+                applySamplePitch(taskId, reason).catch((error) => console.error('Sample pitch retry failed:', error));
+            }
+        }, 120);
+        return;
+    }
+    isSamplePitchProcessing = true;
+    if (dom.playSampleBtn) dom.playSampleBtn.disabled = true;
+
+    try {
+        const processed = await processWithRubberBand(sampleBuffer, { pitchSemitones: semitones, timeRatio: 1 });
+        if (taskId !== samplePitchTaskId) return;
+        pitchedSampleBuffer = processed;
+        if (reason === 'slider') {
+            setStatus(`Sample pitched (${formatPitchLabel(semitones)}).`);
+        }
+    } catch (error) {
+        console.error('Error applying sample pitch:', error);
+        pitchedSampleBuffer = sampleBuffer;
+        setStatus('Pitch shift failed; using original sample.');
+    } finally {
+        isSamplePitchProcessing = false;
+        if (dom.playSampleBtn) dom.playSampleBtn.disabled = false;
+    }
+}
+
+function getCurrentSamplePlaybackBuffer() {
+    return pitchedSampleBuffer || sampleBuffer;
+}
+
 function resetControlsToDefaults() {
     const defaults = CONFIG.DEFAULTS;
     if (!defaults) return;
@@ -1335,6 +1653,16 @@ function resetControlsToDefaults() {
 
     updateRayRadiosityOutputs();
 
+    if (dom.samplePitchSlider) {
+        dom.samplePitchSlider.value = '0';
+        document.querySelectorAll('#samplePitch-val').forEach(el => el.textContent = formatPitchLabel(0));
+    }
+    if (dom.irStretchSlider) {
+        dom.irStretchSlider.value = '1';
+        document.querySelectorAll('#irStretch-val').forEach(el => el.textContent = formatStretchLabel(1));
+    }
+    pitchedSampleBuffer = sampleBuffer || null;
+
     applySeed(defaults.randomSeed);
     rebuildRoom();
 
@@ -1343,6 +1671,9 @@ function resetControlsToDefaults() {
     if (state.realtimeSimEnabled && !state.isSimulating) {
         runRealtimeSimulation();
     }
+
+    scheduleSamplePitchUpdate(true, 'reset');
+    scheduleImpulseResponseStretch(true, 'reset');
 }
 
 function runSimulationWorker() {
@@ -1726,7 +2057,27 @@ function setupEventListeners() {
         });
     });
 
-    if (dom.resetButton) {
+    if (dom.resetButton) {    if (dom.samplePitchSlider) {
+        const outputs = document.querySelectorAll('#samplePitch-val');
+        outputs.forEach(el => el.textContent = formatPitchLabel(parseFloat(dom.samplePitchSlider.value || '0')));
+        dom.samplePitchSlider.addEventListener('input', () => {
+            const value = parseFloat(dom.samplePitchSlider.value || '0');
+            outputs.forEach(el => el.textContent = formatPitchLabel(value));
+            scheduleSamplePitchUpdate(false, 'slider');
+        });
+    }
+
+    if (dom.irStretchSlider) {
+        const outputs = document.querySelectorAll('#irStretch-val');
+        outputs.forEach(el => el.textContent = formatStretchLabel(parseFloat(dom.irStretchSlider.value || '1')));
+        dom.irStretchSlider.addEventListener('input', () => {
+            const value = parseFloat(dom.irStretchSlider.value || '1');
+            outputs.forEach(el => el.textContent = formatStretchLabel(value));
+            scheduleImpulseResponseStretch(false, 'slider');
+        });
+    }
+
+
         dom.resetButton.addEventListener('click', () => {
             resetControlsToDefaults();
         });
@@ -1794,8 +2145,14 @@ function setupEventListeners() {
             return;
         }
         
+        const playbackBuffer = getCurrentSamplePlaybackBuffer();
+        if (!playbackBuffer) {
+            console.warn('Sample unavailable for playback.');
+            return;
+        }
+
         sampleSourceNode = audioContext.createBufferSource();
-        sampleSourceNode.buffer = sampleBuffer;
+        sampleSourceNode.buffer = playbackBuffer;
         
         // Connect to both dry and wet (convolver) paths
         sampleSourceNode.connect(dryGain);
@@ -2007,6 +2364,8 @@ async function startApp() {
     if (window._pendingSampleBuffer && audioContext) {
         try {
             sampleBuffer = await audioContext.decodeAudioData(window._pendingSampleBuffer);
+            pitchedSampleBuffer = sampleBuffer;
+            scheduleSamplePitchUpdate(true, 'load');
             delete window._pendingSampleBuffer;
             if (dom.playSampleBtn) dom.playSampleBtn.disabled = false;
             setStatus('Sample ready');
