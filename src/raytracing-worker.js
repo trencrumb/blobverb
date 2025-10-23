@@ -21,6 +21,73 @@ const _rayOrigin = new THREE.Vector3();
 const _rayDirection = new THREE.Vector3();
 const _tempVec = new THREE.Vector3();
 const _intersectionPoint = new THREE.Vector3();
+const _emitterPositionVec = new THREE.Vector3();
+const _specularDir = new THREE.Vector3();
+
+function samplePoisson(lambda) {
+    if (lambda <= 0) return 0;
+    const L = Math.exp(-lambda);
+    let k = 0;
+    let p = 1;
+    do {
+        k++;
+        p *= Math.random();
+    } while (p > L);
+    return k - 1;
+}
+
+function randomHemisphereDirection(normal) {
+    const u1 = Math.random();
+    const u2 = Math.random();
+
+    const r = Math.sqrt(u1);
+    const phi = 2 * Math.PI * u2;
+
+    const tangent = new THREE.Vector3();
+    const bitangent = new THREE.Vector3();
+
+    if (Math.abs(normal.x) > Math.abs(normal.z)) {
+        tangent.set(-normal.y, normal.x, 0).normalize();
+    } else {
+        tangent.set(0, -normal.z, normal.y).normalize();
+    }
+
+    bitangent.crossVectors(normal, tangent);
+
+    const direction = new THREE.Vector3()
+        .copy(tangent).multiplyScalar(r * Math.cos(phi))
+        .addScaledVector(bitangent, r * Math.sin(phi))
+        .addScaledVector(normal, Math.sqrt(Math.max(0, 1 - u1)))
+        .normalize();
+
+    return direction;
+}
+
+function synthesizeRadiosityPulses(histogram, binSize, poissonDensity, minEnergy) {
+    const pulses = [];
+    for (let i = 0; i < histogram.length; i++) {
+        const energy = histogram[i];
+        if (energy <= minEnergy) continue;
+
+        const lambda = Math.max(energy * poissonDensity, 0);
+        let pulseCount = samplePoisson(lambda);
+        if (pulseCount <= 0) pulseCount = 1;
+
+        const energyPerPulse = energy / pulseCount;
+        const amplitude = Math.sqrt(energyPerPulse);
+        const baseTime = i * binSize;
+
+        for (let j = 0; j < pulseCount; j++) {
+            const timeJitter = Math.random() * binSize;
+            const sign = Math.random() < 0.5 ? -1 : 1;
+            pulses.push({
+                time: baseTime + timeJitter,
+                amplitude: amplitude * sign
+            });
+        }
+    }
+    return pulses;
+}
 
 let raycaster;
 let roomMesh;
@@ -126,10 +193,11 @@ function createEmitterMesh(radius, position) {
         emitterMesh.updateMatrix();
         emitterMesh.updateMatrixWorld(true);
         emitterMesh.visible = true;
-        
+        _emitterPositionVec.set(position.x, position.y, position.z);
+
         // Set layers
         emitterMesh.layers.enableAll();
-        
+
         console.log(`Worker: Emitter sphere created with ${geometry.attributes.position.count} vertices`);
         console.log(`Worker: Emitter BVH bounds:`, geometry.boundsTree.getBoundingBox(new THREE.Box3()));
         console.log(`Worker: Emitter has layers:`, !!emitterMesh.layers);
@@ -151,28 +219,58 @@ function runSimulation(params) {
         absorptionCoeffs = {},
         seed,
         speedOfSound,
-        batchSize = 5000
+        batchSize = 5000,
+        rrConfig: rrOverrides = {}
     } = params;
+
+    const rrConfig = {
+        enabled: true,
+        scatteringCoeff: 0.35,
+        histogramResolution: 0.0025,
+        maxTime: 3.5,
+        hybridBounceThreshold: 3,
+        poissonDensity: 12,
+        minEnergyThreshold: 1e-8,
+        diffuseGain: 1.0,
+        ...rrOverrides
+    };
+
+    rrConfig.histogramResolution = Math.max(1e-4, rrConfig.histogramResolution);
+    rrConfig.maxTime = Math.max(rrConfig.histogramResolution, rrConfig.maxTime);
+    rrConfig.hybridBounceThreshold = Math.max(0, Math.floor(rrConfig.hybridBounceThreshold));
+    rrConfig.poissonDensity = Math.max(0.1, rrConfig.poissonDensity);
+    rrConfig.minEnergyThreshold = Math.max(1e-10, rrConfig.minEnergyThreshold);
+
+    const useRayRadiosity = !!rrConfig.enabled;
+    const scatterWeight = THREE.MathUtils.clamp(rrConfig.scatteringCoeff ?? 0, 0, 1);
+    const diffuseGain = rrConfig.diffuseGain ?? 1.0;
 
     const restoreRandom = Math.random;
     if (seed) {
         seedrandom(seed, { global: true });
     }
-
-    // remove unused broadband reflectionCoefficient
-    // const reflectionCoefficient = 1.0 - wallAbsorption;
     
-    // Setup for multi-band simulation
-    const freqBands = useFreqDependent ? Object.keys(absorptionCoeffs).map(Number).sort((a, b) => a - b) : null;
+    const freqBands = useFreqDependent
+        ? Object.keys(absorptionCoeffs).map(Number).sort((a, b) => a - b)
+        : null;
+
     const arrivalsByBand = useFreqDependent ? {} : null;
     const arrivals = [];
-    
+
     if (useFreqDependent) {
         freqBands.forEach(freq => {
             arrivalsByBand[freq] = [];
         });
     }
 
+    const histogramBins = useRayRadiosity ? Math.ceil(rrConfig.maxTime / rrConfig.histogramResolution) : 0;
+    const rrHistograms = useRayRadiosity
+        ? (useFreqDependent
+            ? Object.fromEntries(freqBands.map(freq => [freq, new Float32Array(histogramBins)]))
+            : new Float32Array(histogramBins))
+        : null;
+
+    let rrContributionCount = 0;
     let processedRays = 0;
     const startTime = performance.now();
 
@@ -198,14 +296,12 @@ function runSimulation(params) {
             ).normalize();
 
             let totalDistance = 0;
-            let bounceCount = 0;
 
-            // Track amplitude per frequency band
-            const amplitudes = useFreqDependent 
+            const amplitudes = useFreqDependent
                 ? Object.fromEntries(freqBands.map(f => [f, 1.0]))
                 : { broadband: 1.0 };
 
-            for (let b = 0; b < maxBounces; b++) {
+            for (let bounce = 0; bounce < maxBounces; bounce++) {
                 ray.set(origin, direction);
 
                 roomIntersects.length = 0;
@@ -230,38 +326,80 @@ function runSimulation(params) {
 
                         if (useFreqDependent) {
                             freqBands.forEach(freq => {
-                                let finalAmp = amplitudes[freq];
+                                const finalAmp = amplitudes[freq];
                                 arrivalsByBand[freq].push({ time: arrivalTime, amplitude: finalAmp });
                             });
                         } else {
-                            let finalAmp = amplitudes.broadband;
+                            const finalAmp = amplitudes.broadband;
                             arrivals.push({ time: arrivalTime, amplitude: finalAmp });
                         }
                         break;
                     }
                 }
 
-                if (roomHit && roomIntersects[0]) {
-                    const intersection = roomIntersects[0];
-                    bounceCount++;
-                    totalDistance += intersection.distance;
-
-                    // Apply frequency-dependent absorption (no wallAbsorption fallback)
-                    if (useFreqDependent) {
-                        freqBands.forEach(freq => {
-                            const absorption = absorptionCoeffs[freq] ?? 0;
-                            amplitudes[freq] *= (1.0 - absorption);
-                        });
-                    } else {
-                        amplitudes.broadband *= (1.0 - (wallAbsorption ?? 0));
-                    }
-
-                    origin.copy(intersection.point);
-                    direction.reflect(intersection.face.normal);
-                    origin.addScaledVector(direction, 0.001);
-                } else {
+                if (!roomHit || !roomIntersects[0]) {
                     break;
                 }
+
+                const intersection = roomIntersects[0];
+                totalDistance += intersection.distance;
+
+                if (useFreqDependent) {
+                    freqBands.forEach(freq => {
+                        const absorption = absorptionCoeffs[freq] ?? 0;
+                        amplitudes[freq] *= (1.0 - absorption);
+                    });
+                } else {
+                    amplitudes.broadband *= (1.0 - (wallAbsorption ?? 0));
+                }
+
+                if (useRayRadiosity && bounce >= rrConfig.hybridBounceThreshold && histogramBins > 0) {
+                    _tempVec.copy(intersection.point).sub(_emitterPositionVec);
+                    const distanceToReceiver = Math.max(_tempVec.length(), Math.max(emitterRadius * 0.5, 0.01));
+                    const timeToReceiver = (totalDistance + distanceToReceiver) / speedOfSound;
+
+                    if (timeToReceiver <= rrConfig.maxTime) {
+                        const invDistanceTerm = 1.0 / Math.max(4 * Math.PI * distanceToReceiver * distanceToReceiver, 1e-6);
+                        const binIndex = Math.floor(timeToReceiver / rrConfig.histogramResolution);
+
+                        if (binIndex < histogramBins) {
+                            if (useFreqDependent) {
+                                for (let f = 0; f < freqBands.length; f++) {
+                                    const freq = freqBands[f];
+                                    const amp = amplitudes[freq];
+                                    if (amp <= 0) continue;
+                                    const diffuseEnergy = amp * amp * diffuseGain * invDistanceTerm * Math.max(scatterWeight, 1e-3);
+                                    if (diffuseEnergy > rrConfig.minEnergyThreshold) {
+                                        rrHistograms[freq][binIndex] += diffuseEnergy;
+                                        rrContributionCount++;
+                                    }
+                                }
+                            } else {
+                                const amp = amplitudes.broadband;
+                                if (amp > 0) {
+                                    const diffuseEnergy = amp * amp * diffuseGain * invDistanceTerm * Math.max(scatterWeight, 1e-3);
+                                    if (diffuseEnergy > rrConfig.minEnergyThreshold) {
+                                        rrHistograms[binIndex] += diffuseEnergy;
+                                        rrContributionCount++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                const faceNormal = intersection.face?.normal ?? _tempVec.set(0, 1, 0);
+                const normal = _intersectionPoint.copy(faceNormal).normalize();
+                const specularDir = _specularDir.copy(direction).reflect(normal);
+                const scatteredDir = scatterWeight > 0 ? randomHemisphereDirection(normal) : specularDir;
+
+                direction.copy(specularDir)
+                    .multiplyScalar(1 - scatterWeight)
+                    .addScaledVector(scatteredDir, scatterWeight)
+                    .normalize();
+
+                origin.copy(intersection.point);
+                origin.addScaledVector(direction, 0.001);
             }
         }
 
@@ -271,8 +409,7 @@ function runSimulation(params) {
         const batchTime = performance.now() - batchStart;
         const raysPerSecond = processedThisBatch > 0 && batchTime > 0 ? Math.round(processedThisBatch / (batchTime / 1000)) : 0;
 
-        // report total arrivals (sum across bands) for progress
-        const currentArrivals = useFreqDependent
+        const earlyArrivals = useFreqDependent
             ? Object.values(arrivalsByBand).reduce((s, a) => s + a.length, 0)
             : arrivals.length;
 
@@ -280,13 +417,48 @@ function runSimulation(params) {
             type: 'progress',
             progress: progress,
             raysPerSecond: raysPerSecond,
-            currentArrivals: currentArrivals
+            currentArrivals: earlyArrivals + (useRayRadiosity ? rrContributionCount : 0)
         });
 
         if (processedRays < numRays) {
             setTimeout(processBatch, 0);
         } else {
             Math.random = restoreRandom;
+
+            let lateArrivalCount = 0;
+
+            if (useRayRadiosity && histogramBins > 0) {
+                if (useFreqDependent) {
+                    for (let f = 0; f < freqBands.length; f++) {
+                        const freq = freqBands[f];
+                        const pulses = synthesizeRadiosityPulses(
+                            rrHistograms[freq],
+                            rrConfig.histogramResolution,
+                            rrConfig.poissonDensity,
+                            rrConfig.minEnergyThreshold
+                        );
+                        if (pulses.length > 0) {
+                            arrivalsByBand[freq].push(...pulses);
+                            lateArrivalCount += pulses.length;
+                        }
+                    }
+                    for (let f = 0; f < freqBands.length; f++) {
+                        arrivalsByBand[freqBands[f]].sort((a, b) => a.time - b.time);
+                    }
+                } else {
+                    const pulses = synthesizeRadiosityPulses(
+                        rrHistograms,
+                        rrConfig.histogramResolution,
+                        rrConfig.poissonDensity,
+                        rrConfig.minEnergyThreshold
+                    );
+                    if (pulses.length > 0) {
+                        arrivals.push(...pulses);
+                        lateArrivalCount += pulses.length;
+                    }
+                    arrivals.sort((a, b) => a.time - b.time);
+                }
+            }
 
             const elapsedTime = performance.now() - startTime;
             const avgRaysPerSecond = elapsedTime > 0 ? Math.round(numRays / (elapsedTime / 1000)) : 0;
@@ -295,17 +467,30 @@ function runSimulation(params) {
                 const totalArrivals = Object.values(arrivalsByBand).reduce((s, a) => s + a.length, 0);
                 self.postMessage({
                     type: 'complete',
-                    arrivalsByBand: arrivalsByBand,
-                    freqBands: freqBands,
-                    totalArrivals: totalArrivals,
-                    avgRaysPerSecond: avgRaysPerSecond
+                    arrivalsByBand,
+                    freqBands,
+                    totalArrivals,
+                    avgRaysPerSecond,
+                    rayRadiosity: {
+                        enabled: useRayRadiosity,
+                        lateArrivalCount,
+                        histogramBins,
+                        rrConfig
+                    }
                 });
             } else {
+                const totalArrivals = arrivals.length;
                 self.postMessage({
                     type: 'complete',
-                    arrivals: arrivals,
-                    totalArrivals: arrivals.length,
-                    avgRaysPerSecond: avgRaysPerSecond
+                    arrivals,
+                    totalArrivals,
+                    avgRaysPerSecond,
+                    rayRadiosity: {
+                        enabled: useRayRadiosity,
+                        lateArrivalCount,
+                        histogramBins,
+                        rrConfig
+                    }
                 });
             }
         }

@@ -47,6 +47,36 @@ canvas {
     overflow-x: hidden;
 }
 
+.panel-footer {
+    position: sticky;
+    bottom: 0;
+    margin-top: auto;
+    padding-top: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: linear-gradient(to top, rgba(18, 20, 28, 0.95), rgba(18, 20, 28, 0.75));
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.panel-footer .cta,
+.panel-footer button {
+    width: 100%;
+}
+
+.ghost {
+    background: transparent;
+    border: 1px solid rgba(98, 132, 255, 0.6);
+    color: #9bb4ff;
+    transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+.ghost:hover {
+    background: rgba(98, 132, 255, 0.12);
+    border-color: rgba(121, 154, 255, 0.8);
+    color: #c8d5ff;
+}
+
 .scene-panel {
     overflow: hidden;
     padding: 0;

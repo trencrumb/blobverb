@@ -33,6 +33,41 @@ const CONFIG = {
     DEFAULT_MAX_BOUNCES: 100,
     SPEED_OF_SOUND: 343,
     EMITTER_RADIUS: 0.5,
+    RAY_RADIOSITY: {
+        enabled: true,
+        scatteringCoeff: 0.45,
+        histogramResolution: 0.003,
+        maxTime: 6.0,
+        hybridBounceThreshold: 3,
+        poissonDensity: 22,
+        minEnergyThreshold: 1e-9,
+        diffuseGain: 1.6
+    },
+    DEFAULTS: {
+        randomSeed: 'nmz6kp.6n',
+        baseRadius: 15,
+        noiseFrequency: 0.2,
+        noiseAmplitude: 5,
+        absorption: {
+            200: 0.15,
+            800: 0.2,
+            3200: 0.25,
+            10000: 0.3
+        },
+        numRays: 15000,
+        useWebWorker: true,
+        realtimePreview: true,
+        rayRadiosity: {
+            enabled: true,
+            scatteringCoeff: 0.45,
+            histogramResolution: 0.003,
+            maxTime: 6.0,
+            hybridBounceThreshold: 3,
+            poissonDensity: 22,
+            minEnergyThreshold: 1e-9,
+            diffuseGain: 1.6
+        }
+    },
     FREQ_BANDS: [
         200,    // Low
         800,    // Mid
@@ -67,9 +102,77 @@ const raycaster = new THREE.Raycaster();
 const vectors = {
     origin: new THREE.Vector3(),
     direction: new THREE.Vector3(),
-    temp: new THREE.Vector3()
+    temp: new THREE.Vector3(),
+    temp2: new THREE.Vector3(),
+    temp3: new THREE.Vector3(),
+    toReceiver: new THREE.Vector3(),
+    specular: new THREE.Vector3(),
+    scatter: new THREE.Vector3()
 };
 raycaster.firstHitOnly = true;
+
+function samplePoisson(lambda) {
+    if (lambda <= 0) return 0;
+    const L = Math.exp(-lambda);
+    let k = 0;
+    let p = 1;
+    do {
+        k++;
+        p *= Math.random();
+    } while (p > L);
+    return k - 1;
+}
+
+function randomHemisphereDirection(normal) {
+    const u1 = Math.random();
+    const u2 = Math.random();
+
+    const r = Math.sqrt(u1);
+    const phi = 2 * Math.PI * u2;
+
+    const tangent = vectors.temp2;
+    const bitangent = vectors.temp3;
+
+    if (Math.abs(normal.x) > Math.abs(normal.z)) {
+        tangent.set(-normal.y, normal.x, 0).normalize();
+    } else {
+        tangent.set(0, -normal.z, normal.y).normalize();
+    }
+
+    bitangent.crossVectors(normal, tangent);
+
+    return vectors.scatter
+        .copy(tangent).multiplyScalar(r * Math.cos(phi))
+        .addScaledVector(bitangent, r * Math.sin(phi))
+        .addScaledVector(normal, Math.sqrt(Math.max(0, 1 - u1)))
+        .normalize();
+}
+
+function synthesizeRadiosityPulses(histogram, binSize, poissonDensity, minEnergy) {
+    const pulses = [];
+    for (let i = 0; i < histogram.length; i++) {
+        const energy = histogram[i];
+        if (energy <= minEnergy) continue;
+
+        const lambda = Math.max(energy * poissonDensity, 0);
+        let pulseCount = samplePoisson(lambda);
+        if (pulseCount <= 0) pulseCount = 1;
+
+        const energyPerPulse = energy / pulseCount;
+        const amplitude = Math.sqrt(energyPerPulse);
+        const baseTime = i * binSize;
+
+        for (let j = 0; j < pulseCount; j++) {
+            const timeJitter = Math.random() * binSize;
+            const sign = Math.random() < 0.5 ? -1 : 1;
+            pulses.push({
+                time: baseTime + timeJitter,
+                amplitude: amplitude * sign
+            });
+        }
+    }
+    return pulses;
+}
 
 // Audio references
 let audioContext;
@@ -115,7 +218,23 @@ function cacheDom() {
         wetSlider: document.getElementById('wet-slider'),
         wetOutput: document.getElementById('wet-output'),
         useWebWorker: document.getElementById('useWebWorker'), 
-        realtimeSimToggle: document.getElementById('realtimeSimToggle') 
+        realtimeSimToggle: document.getElementById('realtimeSimToggle'),
+        rrEnabled: document.getElementById('rrEnabled'),
+        rrScattering: document.getElementById('rrScattering'),
+        rrScatteringOutput: document.getElementById('rrScattering-val'),
+        rrHistogramResolution: document.getElementById('rrHistogramResolution'),
+        rrHistogramResolutionOutput: document.getElementById('rrHistogramResolution-val'),
+        rrMaxTime: document.getElementById('rrMaxTime'),
+        rrMaxTimeOutput: document.getElementById('rrMaxTime-val'),
+        rrHybridBounce: document.getElementById('rrHybridBounce'),
+        rrHybridBounceOutput: document.getElementById('rrHybridBounce-val'),
+        rrPoissonDensity: document.getElementById('rrPoissonDensity'),
+        rrPoissonDensityOutput: document.getElementById('rrPoissonDensity-val'),
+        rrDiffuseGain: document.getElementById('rrDiffuseGain'),
+        rrDiffuseGainOutput: document.getElementById('rrDiffuseGain-val'),
+        rrMinEnergy: document.getElementById('rrMinEnergy'),
+        rrMinEnergyOutput: document.getElementById('rrMinEnergy-val'),
+        resetButton: document.getElementById('resetButton')
     });
 
     if (dom.downloadBtn) dom.downloadBtn.disabled = true;
@@ -352,9 +471,16 @@ function handleWorkerMessage(event) {
         case 'complete': {
             const totalArrivals = message.totalArrivals || 0;
             const avgRps = message.avgRaysPerSecond || 0;
+            const rayRadiosityInfo = message.rayRadiosity;
             
             console.log(`Modern BVH Worker simulation complete: ${totalArrivals} arrivals`);
             console.log(`Performance: ${avgRps} rays/sec average`);
+            if (rayRadiosityInfo?.enabled) {
+                console.log(
+                    `Ray-radiosity tail: ${rayRadiosityInfo.lateArrivalCount} late pulses ` +
+                    `(bins=${rayRadiosityInfo.histogramBins}, resolution=${rayRadiosityInfo.rrConfig?.histogramResolution ?? 'n/a'}s)`
+                );
+            }
             //console.timeEnd('Worker Simulation');
             
             // Handle multi-band or single-band results
@@ -368,7 +494,10 @@ function handleWorkerMessage(event) {
             
             if (dom.startButton) dom.startButton.disabled = false;
             state.isSimulating = false;
-            setStatus(`Complete: ${totalArrivals} arrivals (${avgRps} rays/sec)`);
+            const tailSummary = rayRadiosityInfo?.enabled && rayRadiosityInfo.lateArrivalCount
+                ? `, ${rayRadiosityInfo.lateArrivalCount} RR pulses`
+                : '';
+            setStatus(`Complete: ${totalArrivals} arrivals (${avgRps} rays/sec${tailSummary})`);
             break;
         }
         case 'error':
@@ -465,7 +594,7 @@ function runRealtimeSimulation() {
     
     const useWebWorker = dom.useWebWorker?.checked ?? true;
     const quickSimParams = {
-        numRays: 1500,  // Quick preview
+        numRays: 5000,  // Quick preview
         // use frequency-dependent absorption only
         absorptionCoeffs: {
             200: getNumericInputValue('absorption200', 0.1),
@@ -477,7 +606,8 @@ function runRealtimeSimulation() {
         seed: dom.randomSeed?.value ?? '',
         speedOfSound: CONFIG.SPEED_OF_SOUND,
         maxBounces: state.maxBounces,
-        batchSize: 5000
+        batchSize: 5000,
+        rrConfig: normalizeRayRadiosityConfig(getRayRadiosityConfig())
     };
 
     if (useWebWorker && workerInstance && state.workerGeometryReady) {
@@ -496,58 +626,159 @@ function runQuickMainThreadSimulation(params) {
     state.isSimulating = true;
     setStatus('Quick preview (main thread)...');
 
+    if (!state.roomMesh || !emitterMesh) {
+        console.warn('Simulation unavailable: missing room or emitter mesh.');
+        setStatus('Simulation unavailable: scene not ready.');
+        state.isSimulating = false;
+        return;
+    }
+
     const seed = params.seed || '';
     const restoreRandom = Math.random;
     seedrandom(seed || undefined, { global: true });
 
-    const arrivalsByBand = {};
-    const freqBands = params.freqBands ?? CONFIG.FREQ_BANDS;
+    const freqBands = (params.freqBands ?? CONFIG.FREQ_BANDS).slice().sort((a, b) => a - b);
     const absorptionCoeffs = params.absorptionCoeffs ?? {};
     const numRays = params.numRays || 1500;
+    const maxBounces = params.maxBounces ?? state.maxBounces;
+    const speedOfSound = params.speedOfSound ?? CONFIG.SPEED_OF_SOUND;
+    const rrConfig = normalizeRayRadiosityConfig(params.rrConfig ?? getRayRadiosityConfig());
+    const useRayRadiosity = rrConfig.enabled;
+    const histogramBins = useRayRadiosity ? Math.ceil(rrConfig.maxTime / rrConfig.histogramResolution) : 0;
+
+    const arrivalsByBand = {};
+    freqBands.forEach(freq => {
+        arrivalsByBand[freq] = [];
+    });
+
+    const rrHistograms = useRayRadiosity
+        ? Object.fromEntries(freqBands.map(freq => [freq, new Float32Array(histogramBins)]))
+        : null;
+
+    const emitterRadius = (emitterMesh.geometry?.boundingSphere?.radius) ?? CONFIG.EMITTER_RADIUS;
+    const emitterWorldPos = emitterMesh.getWorldPosition(new THREE.Vector3());
+
+    const roomIntersects = [];
+    const receiverIntersects = [];
 
     for (let i = 0; i < numRays; i++) {
         vectors.origin.set(0, 0, 0);
         vectors.direction.randomDirection();
+
         let totalDistance = 0;
-        let amplitude = 1.0;
-        let bounceCount = 0;
+        const amplitudes = Object.fromEntries(freqBands.map(freq => [freq, 1.0]));
 
-        // assign this ray to a frequency band (randomly)
-        const band = freqBands[Math.floor(Math.random() * freqBands.length)];
-        const reflectionCoefficient = 1.0 - (absorptionCoeffs[band] ?? 0.2);
-
-        for (let j = 0; j < params.maxBounces; j++) {
+        for (let bounce = 0; bounce < maxBounces; bounce++) {
             raycaster.set(vectors.origin, vectors.direction);
-            const roomIntersects = raycaster.intersectObject(state.roomMesh);
-            const receiverIntersects = emitterMesh ? raycaster.intersectObject(emitterMesh) : [];
 
-            if (receiverIntersects.length > 0 && (roomIntersects.length === 0 || receiverIntersects[0].distance < roomIntersects[0].distance)) {
-                if (receiverIntersects[0].distance > 0.001) {
-                    totalDistance += receiverIntersects[0].distance;
-                    let finalAmplitude = amplitude;
-                    (arrivalsByBand[band] = arrivalsByBand[band] || []).push({ time: totalDistance / CONFIG.SPEED_OF_SOUND, amplitude: finalAmplitude });
+            roomIntersects.length = 0;
+            receiverIntersects.length = 0;
+
+            raycaster.intersectObject(state.roomMesh, false, roomIntersects);
+            if (emitterMesh) {
+                raycaster.intersectObject(emitterMesh, false, receiverIntersects);
+            }
+
+            const receiverHit = receiverIntersects.length > 0;
+            const roomHit = roomIntersects.length > 0;
+
+            if (
+                receiverHit &&
+                (!roomHit || receiverIntersects[0].distance < roomIntersects[0].distance)
+            ) {
+                const receiverIntersection = receiverIntersects[0];
+                if (receiverIntersection && receiverIntersection.distance > 0.001) {
+                    totalDistance += receiverIntersection.distance;
+                    const arrivalTime = totalDistance / speedOfSound;
+                    freqBands.forEach(freq => {
+                        arrivalsByBand[freq].push({
+                            time: arrivalTime,
+                            amplitude: amplitudes[freq]
+                        });
+                    });
                     break;
                 }
             }
 
-            if (roomIntersects.length > 0) {
-                const intersection = roomIntersects[0];
-                bounceCount++;
-                totalDistance += intersection.distance;
-                amplitude *= reflectionCoefficient;
-                vectors.origin.copy(intersection.point);
-                vectors.direction.reflect(intersection.face.normal);
-                vectors.temp.copy(vectors.direction).multiplyScalar(0.001);
-                vectors.origin.add(vectors.temp);
-            } else {
-                break;
+            if (!roomHit) break;
+
+            const wallHit = roomIntersects[0];
+            totalDistance += wallHit.distance;
+
+            freqBands.forEach(freq => {
+                const absorption = absorptionCoeffs[freq] ?? 0;
+                amplitudes[freq] *= (1.0 - absorption);
+                if (amplitudes[freq] < 0) amplitudes[freq] = 0;
+            });
+
+            if (useRayRadiosity && histogramBins > 0 && bounce >= rrConfig.hybridBounceThreshold && emitterMesh) {
+                vectors.toReceiver.copy(wallHit.point).sub(emitterWorldPos);
+                const distanceToReceiver = Math.max(vectors.toReceiver.length(), Math.max(emitterRadius * 0.5, 0.01));
+                const timeToReceiver = (totalDistance + distanceToReceiver) / speedOfSound;
+
+                if (timeToReceiver <= rrConfig.maxTime) {
+                    const invDistanceTerm = 1.0 / Math.max(4 * Math.PI * distanceToReceiver * distanceToReceiver, 1e-6);
+                    const binIndex = Math.floor(timeToReceiver / rrConfig.histogramResolution);
+                    if (binIndex < histogramBins) {
+                        freqBands.forEach(freq => {
+                            const amp = amplitudes[freq];
+                            if (amp <= 0) return;
+                            const diffuseEnergy = amp * amp * rrConfig.diffuseGain * invDistanceTerm * Math.max(rrConfig.scatteringCoeff, 1e-3);
+                            if (diffuseEnergy > rrConfig.minEnergyThreshold) {
+                                rrHistograms[freq][binIndex] += diffuseEnergy;
+                            }
+                        });
+                    }
+                }
             }
+
+            const faceNormal = wallHit.face?.normal ?? vectors.temp.set(0, 1, 0);
+            const worldNormal = vectors.temp.copy(faceNormal)
+                .transformDirection(state.roomMesh.matrixWorld)
+                .normalize();
+            const specularDir = vectors.specular.copy(vectors.direction).reflect(worldNormal);
+            const scatteredDir = rrConfig.scatteringCoeff > 0 ? randomHemisphereDirection(worldNormal) : specularDir;
+
+            vectors.direction.copy(specularDir)
+                .multiplyScalar(1 - rrConfig.scatteringCoeff)
+                .addScaledVector(scatteredDir, rrConfig.scatteringCoeff)
+                .normalize();
+
+            vectors.temp.copy(vectors.direction).multiplyScalar(0.001);
+            vectors.origin.copy(wallHit.point).add(vectors.temp);
         }
     }
 
-    // Render multi-band IR
+    let synthesizedLateArrivals = 0;
+
+    if (useRayRadiosity && histogramBins > 0 && rrHistograms) {
+        freqBands.forEach(freq => {
+            const pulses = synthesizeRadiosityPulses(
+                rrHistograms[freq],
+                rrConfig.histogramResolution,
+                rrConfig.poissonDensity,
+                rrConfig.minEnergyThreshold
+            );
+            if (pulses.length > 0) {
+                arrivalsByBand[freq].push(...pulses);
+                synthesizedLateArrivals += pulses.length;
+            }
+            arrivalsByBand[freq].sort((a, b) => a.time - b.time);
+        });
+    } else {
+        freqBands.forEach(freq => {
+            arrivalsByBand[freq].sort((a, b) => a.time - b.time);
+        });
+    }
+
     plotMultiBandImpulseResponse(arrivalsByBand, freqBands);
-    setStatus(`Quick preview: ${Object.values(arrivalsByBand).reduce((s,a)=>s+a.length,0)} arrivals`);
+
+    const totalArrivals = Object.values(arrivalsByBand).reduce((s, a) => s + a.length, 0);
+    const tailSummary = useRayRadiosity && synthesizedLateArrivals
+        ? `, ${synthesizedLateArrivals} RR pulses`
+        : '';
+    setStatus(`Quick preview: ${totalArrivals} arrivals${tailSummary}`);
+
     Math.random = restoreRandom;
     state.isSimulating = false;
 }
@@ -970,6 +1201,150 @@ function getIntegerInputValue(id, fallback = 0) {
     return Number.isFinite(value) ? value : fallback;
 }
 
+function readFloatInput(element, fallback, clampRange) {
+    if (!element) return fallback;
+    const parsed = parseFloat(element.value);
+    if (!Number.isFinite(parsed)) return fallback;
+    if (clampRange) {
+        const [min, max] = clampRange;
+        return Math.min(max, Math.max(min, parsed));
+    }
+    return parsed;
+}
+
+function readIntInput(element, fallback, clampRange) {
+    if (!element) return fallback;
+    const parsed = parseInt(element.value, 10);
+    if (!Number.isFinite(parsed)) return fallback;
+    if (clampRange) {
+        const [min, max] = clampRange;
+        return Math.min(max, Math.max(min, parsed));
+    }
+    return parsed;
+}
+
+function getRayRadiosityConfig() {
+    const defaults = CONFIG.RAY_RADIOSITY;
+    const enabled = dom.rrEnabled ? dom.rrEnabled.checked : defaults.enabled;
+
+    const scattering = readFloatInput(dom.rrScattering, defaults.scatteringCoeff, [0, 1]);
+    const histogramResolution = readFloatInput(dom.rrHistogramResolution, defaults.histogramResolution, [0.0005, 0.05]);
+    const maxTime = readFloatInput(dom.rrMaxTime, defaults.maxTime, [histogramResolution, 20]);
+    const hybridBounceThreshold = readIntInput(dom.rrHybridBounce, defaults.hybridBounceThreshold, [0, 64]);
+    const poissonDensity = readFloatInput(dom.rrPoissonDensity, defaults.poissonDensity, [0.1, 128]);
+    const diffuseGain = readFloatInput(dom.rrDiffuseGain, defaults.diffuseGain, [0.01, 10]);
+    const minEnergyThreshold = readFloatInput(dom.rrMinEnergy, defaults.minEnergyThreshold, [1e-12, 1e-3]);
+
+    return {
+        enabled,
+        scatteringCoeff: scattering,
+        histogramResolution,
+        maxTime,
+        hybridBounceThreshold,
+        poissonDensity,
+        diffuseGain,
+        minEnergyThreshold
+    };
+}
+
+function normalizeRayRadiosityConfig(configOverrides) {
+    const base = CONFIG.RAY_RADIOSITY;
+    const cfg = {
+        ...base,
+        ...(configOverrides || {})
+    };
+
+    cfg.scatteringCoeff = THREE.MathUtils.clamp(cfg.scatteringCoeff ?? base.scatteringCoeff, 0, 1);
+    cfg.histogramResolution = Math.max(0.0005, cfg.histogramResolution ?? base.histogramResolution);
+    cfg.maxTime = Math.max(cfg.histogramResolution, cfg.maxTime ?? base.maxTime);
+    cfg.hybridBounceThreshold = Math.max(0, Math.floor(cfg.hybridBounceThreshold ?? base.hybridBounceThreshold));
+    cfg.poissonDensity = Math.max(0.1, cfg.poissonDensity ?? base.poissonDensity);
+    cfg.minEnergyThreshold = Math.max(1e-12, cfg.minEnergyThreshold ?? base.minEnergyThreshold);
+    cfg.diffuseGain = Math.max(0.01, cfg.diffuseGain ?? base.diffuseGain);
+    cfg.enabled = !!cfg.enabled;
+
+    return cfg;
+}
+
+function updateRayRadiosityOutputs() {
+    const cfg = getRayRadiosityConfig();
+    if (dom.rrScatteringOutput) dom.rrScatteringOutput.textContent = cfg.scatteringCoeff.toFixed(2);
+    if (dom.rrHistogramResolutionOutput) dom.rrHistogramResolutionOutput.textContent = cfg.histogramResolution.toFixed(4) + ' s';
+    if (dom.rrMaxTimeOutput) dom.rrMaxTimeOutput.textContent = cfg.maxTime.toFixed(2) + ' s';
+    if (dom.rrHybridBounceOutput) dom.rrHybridBounceOutput.textContent = `${cfg.hybridBounceThreshold}`;
+    if (dom.rrPoissonDensityOutput) dom.rrPoissonDensityOutput.textContent = cfg.poissonDensity.toFixed(1);
+    if (dom.rrDiffuseGainOutput) dom.rrDiffuseGainOutput.textContent = cfg.diffuseGain.toFixed(2);
+    if (dom.rrMinEnergyOutput) dom.rrMinEnergyOutput.textContent = cfg.minEnergyThreshold.toExponential(1);
+}
+
+function resetControlsToDefaults() {
+    const defaults = CONFIG.DEFAULTS;
+    if (!defaults) return;
+
+    if (dom.randomSeed) dom.randomSeed.value = defaults.randomSeed;
+
+    if (dom.baseRadius) {
+        dom.baseRadius.value = defaults.baseRadius;
+        const display = document.getElementById('baseRadius-val');
+        if (display) display.textContent = defaults.baseRadius;
+    }
+
+    if (dom.noiseFrequency) {
+        dom.noiseFrequency.value = defaults.noiseFrequency;
+        const display = document.getElementById('noiseFreq-val');
+        if (display) display.textContent = defaults.noiseFrequency;
+    }
+
+    if (dom.noiseAmplitude) {
+        dom.noiseAmplitude.value = defaults.noiseAmplitude;
+        const display = document.getElementById('noiseAmp-val');
+        if (display) display.textContent = defaults.noiseAmplitude;
+    }
+
+    const absorptionDefaults = defaults.absorption || {};
+    const absorptionIds = [200, 800, 3200, 10000];
+    absorptionIds.forEach(freq => {
+        const slider = document.getElementById(`absorption${freq}`);
+        const display = document.getElementById(`absorption${freq}-val`);
+        const value = absorptionDefaults[freq] ?? slider?.value;
+        if (!slider || value === undefined) return;
+        slider.value = value;
+        if (display) display.textContent = value;
+    });
+
+    const numRaysInput = document.getElementById('numRays');
+    if (numRaysInput) {
+        numRaysInput.value = defaults.numRays;
+        const display = document.getElementById('numRays-val');
+        if (display) display.textContent = defaults.numRays;
+    }
+
+    if (dom.useWebWorker) dom.useWebWorker.checked = defaults.useWebWorker;
+    if (dom.realtimeSimToggle) dom.realtimeSimToggle.checked = defaults.realtimePreview;
+    state.realtimeSimEnabled = defaults.realtimePreview;
+
+    const rrDefaults = defaults.rayRadiosity || {};
+    if (dom.rrEnabled) dom.rrEnabled.checked = rrDefaults.enabled ?? CONFIG.RAY_RADIOSITY.enabled;
+    if (dom.rrScattering) dom.rrScattering.value = rrDefaults.scatteringCoeff ?? CONFIG.RAY_RADIOSITY.scatteringCoeff;
+    if (dom.rrHistogramResolution) dom.rrHistogramResolution.value = rrDefaults.histogramResolution ?? CONFIG.RAY_RADIOSITY.histogramResolution;
+    if (dom.rrMaxTime) dom.rrMaxTime.value = rrDefaults.maxTime ?? CONFIG.RAY_RADIOSITY.maxTime;
+    if (dom.rrHybridBounce) dom.rrHybridBounce.value = rrDefaults.hybridBounceThreshold ?? CONFIG.RAY_RADIOSITY.hybridBounceThreshold;
+    if (dom.rrPoissonDensity) dom.rrPoissonDensity.value = rrDefaults.poissonDensity ?? CONFIG.RAY_RADIOSITY.poissonDensity;
+    if (dom.rrDiffuseGain) dom.rrDiffuseGain.value = rrDefaults.diffuseGain ?? CONFIG.RAY_RADIOSITY.diffuseGain;
+    if (dom.rrMinEnergy) dom.rrMinEnergy.value = rrDefaults.minEnergyThreshold ?? CONFIG.RAY_RADIOSITY.minEnergyThreshold;
+
+    updateRayRadiosityOutputs();
+
+    applySeed(defaults.randomSeed);
+    rebuildRoom();
+
+    setStatus('Controls reset to defaults.');
+
+    if (state.realtimeSimEnabled && !state.isSimulating) {
+        runRealtimeSimulation();
+    }
+}
+
 function runSimulationWorker() {
     if (state.isSimulating) return;
     if (!workerInstance) {
@@ -1004,7 +1379,8 @@ function runSimulationWorker() {
         },
         seed: dom.randomSeed?.value ?? '',
         speedOfSound: CONFIG.SPEED_OF_SOUND,
-        batchSize: 5000
+        batchSize: 5000,
+        rrConfig: normalizeRayRadiosityConfig(getRayRadiosityConfig())
     };
 
     console.log('Starting worker simulation with params:', params);
@@ -1045,7 +1421,11 @@ function runSimulationMainThread() {
         return;
     }
 
-    const freqBands = CONFIG.FREQ_BANDS;
+    if (emitterMesh.geometry && !emitterMesh.geometry.boundingSphere) {
+        emitterMesh.geometry.computeBoundingSphere();
+    }
+
+    const freqBands = CONFIG.FREQ_BANDS.slice().sort((a, b) => a - b);
     const absorptionCoeffs = {
         200: getNumericInputValue('absorption200', 0.1),
         800: getNumericInputValue('absorption800', 0.15),
@@ -1053,127 +1433,240 @@ function runSimulationMainThread() {
         10000: getNumericInputValue('absorption10000', 0.25)
     };
 
-    const arrivalsByBand = {};
+    const rrConfig = normalizeRayRadiosityConfig(getRayRadiosityConfig());
+    const useRayRadiosity = rrConfig.enabled;
+    const histogramBins = useRayRadiosity ? Math.ceil(rrConfig.maxTime / rrConfig.histogramResolution) : 0;
+    const speedOfSound = CONFIG.SPEED_OF_SOUND;
+
+    const arrivalsByBand = Object.fromEntries(freqBands.map(freq => [freq, []]));
+    const rrHistograms = useRayRadiosity
+        ? Object.fromEntries(freqBands.map(freq => [freq, new Float32Array(histogramBins)]))
+        : null;
+    let rrContributionCount = 0;
+
+    const emitterRadius = emitterMesh.geometry?.boundingSphere?.radius ?? CONFIG.EMITTER_RADIUS;
+    const emitterWorldPos = emitterMesh.getWorldPosition(new THREE.Vector3());
+    const visualizeBand = freqBands[Math.floor(freqBands.length / 2)] ?? freqBands[0];
+
+    const roomIntersections = [];
+    const receiverIntersections = [];
+
     let currentRay = 0;
 
-    const maxSegments = raysToVisualize * MAX_BOUNCES * 2;
+    const maxSegments = Math.max(1, raysToVisualize * MAX_BOUNCES * 2);
     const linePositions = new Float32Array(maxSegments * 3);
     const lineColors = new Float32Array(maxSegments * 3);
     let positionIndex = 0;
     let colorIndex = 0;
 
+    function appendPathSegments(pathInfo) {
+        if (!pathInfo || pathInfo.length < 2) return;
+        const baseColor = new THREE.Color().setHSL(Math.random(), 0.8, 0.55);
+        for (let i = 0; i < pathInfo.length - 1; i++) {
+            if (positionIndex > linePositions.length - 6 || colorIndex > lineColors.length - 6) break;
+            const start = pathInfo[i];
+            const end = pathInfo[i + 1];
+
+            linePositions[positionIndex++] = start.point.x;
+            linePositions[positionIndex++] = start.point.y;
+            linePositions[positionIndex++] = start.point.z;
+            linePositions[positionIndex++] = end.point.x;
+            linePositions[positionIndex++] = end.point.y;
+            linePositions[positionIndex++] = end.point.z;
+
+            let segmentColor = baseColor;
+            if (lineColorMode === 'energy') {
+                const energy = THREE.MathUtils.clamp(Math.abs(start.amplitude), 0, 1);
+                segmentColor = new THREE.Color().setHSL(0.68, 0.95, 0.2 + energy * 0.5);
+            }
+
+            lineColors[colorIndex++] = segmentColor.r;
+            lineColors[colorIndex++] = segmentColor.g;
+            lineColors[colorIndex++] = segmentColor.b;
+            lineColors[colorIndex++] = segmentColor.r;
+            lineColors[colorIndex++] = segmentColor.g;
+            lineColors[colorIndex++] = segmentColor.b;
+        }
+    }
+
     function processBatch() {
         const startRay = currentRay;
         const endRay = Math.min(currentRay + BATCH_SIZE, numRays);
-        const startTime = performance.now();
+        const batchStart = performance.now();
 
         for (let i = currentRay; i < endRay; i++) {
             vectors.origin.set(0, 0, 0);
             vectors.direction.randomDirection();
-            let totalDistance = 0;
-            let amplitude = 1.0;
-            let bounceCount = 0;
 
-            // choose band for this ray
-            const band = freqBands[Math.floor(Math.random() * freqBands.length)];
-            const reflectionCoefficient = 1.0 - (absorptionCoeffs[band] ?? 0.2);
+            let totalDistance = 0;
+            const amplitudes = Object.fromEntries(freqBands.map(freq => [freq, 1.0]));
 
             const shouldVisualize = i < raysToVisualize;
-            const pathInfo = shouldVisualize ? [{ point: vectors.origin.clone(), amplitude: 1.0 }] : null;
+            const pathInfo = shouldVisualize ? [{ point: vectors.origin.clone(), amplitude: amplitudes[visualizeBand] }] : null;
 
-            for (let j = 0; j < MAX_BOUNCES; j++) {
+            for (let bounce = 0; bounce < MAX_BOUNCES; bounce++) {
                 raycaster.set(vectors.origin, vectors.direction);
-                const roomIntersects = raycaster.intersectObject(state.roomMesh);
-                const receiverIntersects = emitterMesh ? raycaster.intersectObject(emitterMesh) : [];
 
-                if (receiverIntersects.length > 0 && (roomIntersects.length === 0 || receiverIntersects[0].distance < roomIntersects[0].distance)) {
-                    if (receiverIntersects[0].distance > 0.001) {
-                        totalDistance += receiverIntersects[0].distance;
-                        if (shouldVisualize) pathInfo.push({ point: receiverIntersects[0].point.clone(), amplitude });
-                        let finalAmplitude = amplitude;
-                        (arrivalsByBand[band] = arrivalsByBand[band] || []).push({ time: totalDistance / CONFIG.SPEED_OF_SOUND, amplitude: finalAmplitude });
+                roomIntersections.length = 0;
+                receiverIntersections.length = 0;
+
+                raycaster.intersectObject(state.roomMesh, false, roomIntersections);
+                if (emitterMesh) {
+                    raycaster.intersectObject(emitterMesh, false, receiverIntersections);
+                }
+
+                const receiverHit = receiverIntersections.length > 0;
+                const roomHit = roomIntersections.length > 0;
+
+                if (
+                    receiverHit &&
+                    (!roomHit || receiverIntersections[0].distance < roomIntersections[0].distance)
+                ) {
+                    const receiverIntersection = receiverIntersections[0];
+                    if (receiverIntersection && receiverIntersection.distance > 0.001) {
+                        totalDistance += receiverIntersection.distance;
+                        const arrivalTime = totalDistance / speedOfSound;
+
+                        freqBands.forEach(freq => {
+                            arrivalsByBand[freq].push({
+                                time: arrivalTime,
+                                amplitude: amplitudes[freq]
+                            });
+                        });
+
+                        if (pathInfo) {
+                            pathInfo.push({
+                                point: receiverIntersection.point.clone(),
+                                amplitude: amplitudes[visualizeBand]
+                            });
+                        }
+
                         break;
                     }
                 }
 
-                if (roomIntersects.length > 0) {
-                    const intersection = roomIntersects[0];
-                    bounceCount++;
-                    totalDistance += intersection.distance;
-                    amplitude *= reflectionCoefficient;
-                    vectors.origin.copy(intersection.point);
-                    if (shouldVisualize) pathInfo.push({ point: vectors.origin.clone(), amplitude });
+                if (!roomHit) break;
 
-                    vectors.direction.reflect(intersection.face.normal);
-                    vectors.temp.copy(vectors.direction).multiplyScalar(0.001);
-                    vectors.origin.add(vectors.temp);
-                } else {
-                    break;
+                const wallHit = roomIntersections[0];
+                totalDistance += wallHit.distance;
+
+                freqBands.forEach(freq => {
+                    const absorption = absorptionCoeffs[freq] ?? 0;
+                    amplitudes[freq] *= (1.0 - absorption);
+                    if (amplitudes[freq] < 0) amplitudes[freq] = 0;
+                });
+
+                if (pathInfo) {
+                    pathInfo.push({
+                        point: wallHit.point.clone(),
+                        amplitude: amplitudes[visualizeBand]
+                    });
                 }
-            }
 
-            if (shouldVisualize && pathInfo) {
-                const pathColor = new THREE.Color().setHSL(Math.random(), 0.8, 0.6);
-                for (let k = 0; k < pathInfo.length - 1; k++) {
-                    const start = pathInfo[k];
-                    const end = pathInfo[k + 1];
+                if (useRayRadiosity && histogramBins > 0 && bounce >= rrConfig.hybridBounceThreshold && emitterMesh) {
+                    vectors.toReceiver.copy(wallHit.point).sub(emitterWorldPos);
+                    const distanceToReceiver = Math.max(vectors.toReceiver.length(), Math.max(emitterRadius * 0.5, 0.01));
+                    const timeToReceiver = (totalDistance + distanceToReceiver) / speedOfSound;
 
-                    if (positionIndex < linePositions.length - 5) {
-                        linePositions[positionIndex++] = start.point.x;
-                        linePositions[positionIndex++] = start.point.y;
-                        linePositions[positionIndex++] = start.point.z;
-                        linePositions[positionIndex++] = end.point.x;
-                        linePositions[positionIndex++] = end.point.y;
-                        linePositions[positionIndex++] = end.point.z;
-
-                        let segmentColor = pathColor;
-                        if (lineColorMode === 'energy') {
-                            segmentColor = new THREE.Color().setHSL(0.7, 1.0, 0.2 + start.amplitude * 0.5);
+                    if (timeToReceiver <= rrConfig.maxTime) {
+                        const invDistanceTerm = 1.0 / Math.max(4 * Math.PI * distanceToReceiver * distanceToReceiver, 1e-6);
+                        const binIndex = Math.floor(timeToReceiver / rrConfig.histogramResolution);
+                        if (binIndex < histogramBins) {
+                            freqBands.forEach(freq => {
+                                const amp = amplitudes[freq];
+                                if (amp <= 0) return;
+                                const diffuseEnergy = amp * amp * rrConfig.diffuseGain * invDistanceTerm * Math.max(rrConfig.scatteringCoeff, 1e-3);
+                                if (diffuseEnergy > rrConfig.minEnergyThreshold) {
+                                    rrHistograms[freq][binIndex] += diffuseEnergy;
+                                    rrContributionCount++;
+                                }
+                            });
                         }
-
-                        lineColors[colorIndex++] = segmentColor.r;
-                        lineColors[colorIndex++] = segmentColor.g;
-                        lineColors[colorIndex++] = segmentColor.b;
-                        lineColors[colorIndex++] = segmentColor.r;
-                        lineColors[colorIndex++] = segmentColor.g;
-                        lineColors[colorIndex++] = segmentColor.b;
                     }
                 }
+
+                const faceNormal = wallHit.face?.normal ?? vectors.temp.set(0, 1, 0);
+                const worldNormal = vectors.temp.copy(faceNormal)
+                    .transformDirection(state.roomMesh.matrixWorld)
+                    .normalize();
+                const specularDir = vectors.specular.copy(vectors.direction).reflect(worldNormal);
+                const scatteredDir = rrConfig.scatteringCoeff > 0 ? randomHemisphereDirection(worldNormal) : specularDir;
+
+                vectors.direction.copy(specularDir)
+                    .multiplyScalar(1 - rrConfig.scatteringCoeff)
+                    .addScaledVector(scatteredDir, rrConfig.scatteringCoeff)
+                    .normalize();
+
+                vectors.temp.copy(vectors.direction).multiplyScalar(0.001);
+                vectors.origin.copy(wallHit.point).add(vectors.temp);
+            }
+
+            if (pathInfo && pathInfo.length > 1) {
+                appendPathSegments(pathInfo);
             }
         }
 
         currentRay = endRay;
-        const batchTime = performance.now() - startTime;
+        const batchTime = performance.now() - batchStart;
         const processed = endRay - startRay;
         const raysPerSecond = processed > 0 && batchTime > 0 ? Math.round(processed / (batchTime / 1000)) : 0;
+        const earlyArrivals = Object.values(arrivalsByBand).reduce((sum, arr) => sum + arr.length, 0);
 
         if (currentRay < numRays) {
-            setStatus(`Simulating (Main Thread)... ${Math.round((currentRay / numRays) * 100)}% (${raysPerSecond} rays/sec)`);
+            const percent = Math.round((currentRay / numRays) * 100);
+            setStatus(`Simulating (Main Thread)... ${percent}% (${raysPerSecond} rays/sec, ${earlyArrivals + rrContributionCount} events)`);
             if (window.requestIdleCallback) {
                 requestIdleCallback(processBatch);
             } else {
                 setTimeout(processBatch, 0);
             }
         } else {
-            while (rayLinesGroup.children.length > 0) rayLinesGroup.remove(rayLinesGroup.children[0]);
-
-            if (positionIndex > 0) {
-                const lineGeometry = new THREE.BufferGeometry();
-                lineGeometry.setAttribute('position', new THREE.Float32BufferAttribute(linePositions.slice(0, positionIndex), 3));
-                lineGeometry.setAttribute('color', new THREE.Float32BufferAttribute(lineColors.slice(0, colorIndex), 3));
-                const lineMaterial = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.6 });
-                const lineSegments = new THREE.LineSegments(lineGeometry, lineMaterial);
-                rayLinesGroup.add(lineSegments);
-            }
-
-            console.timeEnd('Main Thread Simulation');
-            // plot multi-band IR
-            plotMultiBandImpulseResponse(arrivalsByBand, freqBands);
-            if (dom.startButton) dom.startButton.disabled = false;
-            setStatus(`Simulation complete: ${Object.values(arrivalsByBand).reduce((s,a)=>s+a.length,0)} arrivals`);
-            Math.random = restoreRandom;
-            state.isSimulating = false;
+            finalizeSimulation();
         }
+    }
+
+    function finalizeSimulation() {
+        while (rayLinesGroup.children.length > 0) rayLinesGroup.remove(rayLinesGroup.children[0]);
+
+        if (positionIndex > 0) {
+            const lineGeometry = new THREE.BufferGeometry();
+            lineGeometry.setAttribute('position', new THREE.Float32BufferAttribute(linePositions.slice(0, positionIndex), 3));
+            lineGeometry.setAttribute('color', new THREE.Float32BufferAttribute(lineColors.slice(0, colorIndex), 3));
+            const lineMaterial = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.6 });
+            const lineSegments = new THREE.LineSegments(lineGeometry, lineMaterial);
+            rayLinesGroup.add(lineSegments);
+        }
+
+        let lateArrivalCount = 0;
+        if (useRayRadiosity && histogramBins > 0 && rrHistograms) {
+            freqBands.forEach(freq => {
+                const pulses = synthesizeRadiosityPulses(
+                    rrHistograms[freq],
+                    rrConfig.histogramResolution,
+                    rrConfig.poissonDensity,
+                    rrConfig.minEnergyThreshold
+                );
+                if (pulses.length > 0) {
+                    arrivalsByBand[freq].push(...pulses);
+                    lateArrivalCount += pulses.length;
+                }
+                arrivalsByBand[freq].sort((a, b) => a.time - b.time);
+            });
+            console.log(`Ray-radiosity histogram contributions: ${rrContributionCount}, synthesized pulses: ${lateArrivalCount}`);
+        } else {
+            freqBands.forEach(freq => {
+                arrivalsByBand[freq].sort((a, b) => a.time - b.time);
+            });
+        }
+
+        console.timeEnd('Main Thread Simulation');
+        plotMultiBandImpulseResponse(arrivalsByBand, freqBands);
+        if (dom.startButton) dom.startButton.disabled = false;
+        const totalArrivals = Object.values(arrivalsByBand).reduce((s, a) => s + a.length, 0);
+        const tailSummary = useRayRadiosity && lateArrivalCount ? `, ${lateArrivalCount} RR pulses` : '';
+        setStatus(`Simulation complete: ${totalArrivals} arrivals${tailSummary}`);
+        Math.random = restoreRandom;
+        state.isSimulating = false;
     }
 
     processBatch();
@@ -1195,6 +1688,47 @@ function setupEventListeners() {
         dom.realtimeSimToggle.addEventListener('change', () => {
             state.realtimeSimEnabled = dom.realtimeSimToggle.checked;
             setStatus(state.realtimeSimEnabled ? 'Realtime preview enabled' : 'Realtime preview disabled');
+        });
+    }
+
+    const rrInputs = [
+        dom.rrEnabled,
+        dom.rrScattering,
+        dom.rrHistogramResolution,
+        dom.rrMaxTime,
+        dom.rrHybridBounce,
+        dom.rrPoissonDensity,
+        dom.rrDiffuseGain,
+        dom.rrMinEnergy
+    ].filter(Boolean);
+    rrInputs.forEach(input => {
+        const eventName = input.type === 'checkbox' ? 'change' : 'input';
+        input.addEventListener(eventName, updateRayRadiosityOutputs);
+    });
+    updateRayRadiosityOutputs();
+
+    // Room controls that should trigger an immediate preview when realtime is enabled
+    const realtimeInputs = [
+        dom.baseRadius,
+        dom.noiseFrequency,
+        dom.noiseAmplitude,
+        document.getElementById('absorption200'),
+        document.getElementById('absorption800'),
+        document.getElementById('absorption3200'),
+        document.getElementById('absorption10000')
+    ].filter(Boolean);
+    realtimeInputs.forEach(input => {
+        const evt = input.type === 'range' ? 'input' : 'change';
+        input.addEventListener(evt, () => {
+            if (state.realtimeSimEnabled && !state.isSimulating) {
+                runRealtimeSimulation();
+            }
+        });
+    });
+
+    if (dom.resetButton) {
+        dom.resetButton.addEventListener('click', () => {
+            resetControlsToDefaults();
         });
     }
 
@@ -1548,7 +2082,7 @@ function animate() {
         const rms = Math.sqrt(amplitudeMeter.getRMS());
         rmsEnvelope.process(rms);
 
-        state.shaderMaterial.uniforms.uTime.value = performance.now() * 0.0001 * (1 + smoothPeak * 15);
+        state.shaderMaterial.uniforms.uTime.value = performance.now() * 0.0004 * (1 + smoothPeak * 15);
     }
 }
 
