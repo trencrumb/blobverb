@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BlobVerb</title>
+    <link rel="icon" href="/blobverb/assets/favicon-DRBzVUzX.ico">
+    <link rel="apple-touch-icon" sizes="180x180" href="/blobverb/assets/apple-touch-icon-BXdAAT3T.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="/blobverb/assets/favicon-32x32-gakCKmq2.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="/blobverb/assets/favicon-16x16-C38QRaLz.png">
+    <link rel="manifest" href="/blobverb/assets/site-DLKIwTBe.webmanifest">
+  <script type="module" crossorigin src="/blobverb/assets/index-nUkUkahL.js"></script>
+  <link rel="stylesheet" crossorigin href="/blobverb/assets/index-Cp42pOce.css">
+</head>
+<body>
+    <div id="splashScreen">
+        <div class="splash-content">
+            <h1>BlobVerb</h1>
+            <p>Press start to unlock audio</p>
+            <button id="enterAppBtn" class="cta">Enter</button>
+        </div>
+    </div>
+    <div class="app-layout">
+        <div class="top-row">
+            <div id="scenePanel" class="panel scene-panel">
+                <div id="threeViewport" class="scene-viewport"></div>
+            </div>
+
+            <div id="controlPanel" class="panel">
+                <section class="panel-section is-open" data-section="about">
+                    <button class="section-toggle" type="button" aria-expanded="false">
+                        <span>About</span>
+                        <span class="toggle-icon" aria-hidden="true"></span>
+                    </button>
+                    <div class="section-body">
+                        <p>Uses physically based techniques to create reverb from 3D shapes, using ray-tracing to calculate the early reflections and ray-radiosity for the late reverberations of a impulse response, which is then convolved with the input audio.</p>
+                        <p>Once the impulse response is synthesized you can audition it immediately with the built-in samples or upload your own dry audio, then download the IR for use in any convolution reverb.</p>
+                        <p>Under the hood: <strong>Three.js</strong> renders the scene, <strong>three-mesh-bvh</strong> accelerates ray intersections, <strong>WaveSurfer.js</strong> hosts the IR preview, <strong>WEQ8</strong> shapes the mix, and <strong>Rubber Band WASM</strong> drives the stretch/pitch tools.</p>
+                        <p>Designed and built by <a href="https://kyle-ramsey.com" target="_blank" rel="noopener">Kyle Ramsey</a>. Source code and latest updates live on <a href="https://github.com/kyle-ramsey/blobverb" target="_blank" rel="noopener">GitHub</a>.</p>
+                    </div>
+                </section>
+                <section class="panel-section" data-section="instructions">
+                    <button class="section-toggle" type="button" aria-expanded="false">
+                        <span>Instructions</span>
+                        <span class="toggle-icon" aria-hidden="true"></span>
+                    </button>
+                    <div class="section-body">
+                        <ol>
+                            <li>Adjust the simulation parameters to define the room shape and acoustic properties.</li>
+                            <li>As you move the parameters, quick simulations of around 3000 rays will be run to give you immediate feedback.</li>
+                            <li>However, for the final, better quality simulation, please click the "Simulate Acoustics" button below.</li>
+                            <li>This will run the ray tracing simulation. This may take a few moments.</li>
+                            <li>Click on the waveform in the bottom right corner to hear the impulse response, press Play sample in the bottom left corner to hear your input sound in the convolution reverb</li>
+                            <li>Once the simulation is complete, you can play sample audio or upload your own dry audio file to hear it convolved with the generated impulse response.</li>
+                            <li>You can also download the generated impulse response as a .wav file for use in other audio software.</li>
+                        </ol>
+                        <p>Note: For best performance, use a modern browser that supports Web Audio and WebGL.</p>
+                    </div>
+
+                </section>
+                <section class="panel-section is-open" data-section="room">
+                    <button class="section-toggle" type="button" aria-expanded="true">
+                        <span>Room Setup</span>
+                        <span class="toggle-icon" aria-hidden="true"></span>
+                    </button>
+                    <div class="section-body">
+                        <fieldset>
+                            <legend>Core Properties</legend>
+                            <div class="control-group">
+                                <label for="randomSeed">Simulation Seed</label>
+                                <div class="flex-row">
+                                    <input type="text" id="randomSeed" value="nmz6kp.6n">
+                                    <button id="randomizeSeedBtn" title="Generate Random Seed">🎲</button>
+                                </div>
+                            </div>
+                        </fieldset>
+
+                        <fieldset>
+                            <legend>Procedural Shape</legend>
+                            <div class="control-group">
+                                <label for="baseRadius">Radius <span id="baseRadius-val">15</span> m</label>
+                                <input type="range" id="baseRadius" min="5" max="30" step="1" value="15">
+                            </div>
+                            <div class="control-group">
+                                <label for="noiseFreq">Noise Freq <span id="noiseFreq-val">0.2</span></label>
+                                <input type="range" id="noiseFreq" min="0.05" max="1.0" step="0.01" value="0.2">
+                            </div>
+                            <div class="control-group">
+                                <label for="noiseAmp">Noise Amp <span id="noiseAmp-val">5</span> m</label>
+                                <input type="range" id="noiseAmp" min="0" max="10" step="0.1" value="5">
+                            </div>
+                        </fieldset>
+
+                        <fieldset>
+                            <legend>Frequency Absorption</legend>
+                            <div id="freq-absorption-controls" class="control-group">
+                                <label>200 Hz: <span id="absorption200-val">0.15</span><input type="range" id="absorption200" min="0.01" max="1" step="0.01" value="0.15" /></label>
+                                <label>800 Hz: <span id="absorption800-val">0.2</span><input type="range" id="absorption800" min="0.01" max="1" step="0.01" value="0.2" /></label>
+                                <label>3200 Hz: <span id="absorption3200-val">0.25</span><input type="range" id="absorption3200" min="0.01" max="1" step="0.01" value="0.25" /></label>
+                                <label>10000 Hz: <span id="absorption10000-val">0.3</span><input type="range" id="absorption10000" min="0.01" max="1" step="0.01" value="0.3" /></label>
+                            </div>
+                        </fieldset>
+
+                    </div>
+                </section>
+
+                <section class="panel-section" data-section="advanced">
+                    <button class="section-toggle" type="button" aria-expanded="false">
+                        <span>Advanced Settings</span>
+                        <span class="toggle-icon" aria-hidden="true"></span>
+                    </button>
+                    <div class="section-body">
+                        <fieldset>
+                            <legend>Simulation Engine</legend>
+                            <div class="control-group">
+                                <label for="numRays">Number of Rays <span id="numRays-val">15000</span></label>
+                                <input type="range" id="numRays" min="1" max="30000" step="10" value="15000">
+                            </div>
+                            <div class="control-group">
+                                <label>
+                                    <input type="checkbox" id="useWebWorker" checked />
+                                    Use Web Worker
+                                </label>
+                            </div>
+                            <div class="control-group">
+                                <label>
+                                    <input type="checkbox" id="realtimeSimToggle" checked/>
+                                    Realtime Preview (1500 rays)
+                                </label>
+                            </div>
+                        </fieldset>
+
+                        <fieldset class="advanced-settings">
+                            <legend>Ray-Radiosity Tail</legend>
+                            <div class="control-group">
+                                <label>
+                                    <input type="checkbox" id="rrEnabled" checked />
+                                    Enable diffuse tail (RR)
+                                </label>
+                            </div>
+                            <div class="control-group">
+                                <label for="rrScattering">Scattering Mix <span id="rrScattering-val">0.3</span></label>
+                                <input type="range" id="rrScattering" min="0" max="0.4" step="0.05" value="0.3">
+                            </div>
+                            <div class="control-group">
+                                <label for="rrHistogramResolution">Histogram Bin <span id="rrHistogramResolution-val">0.0030 s</span></label>
+                                <input type="number" id="rrHistogramResolution" min="0.0001" max="0.01" step="0.0001" value="0.003">
+                            </div>
+                            <div class="control-group">
+                                <label for="rrMaxTime">Tail Duration <span id="rrMaxTime-val">6.00 s</span></label>
+                                <input type="number" id="rrMaxTime" min="3" max="20" step="0.5" value="6">
+                            </div>
+                            <div class="control-group">
+                                <label for="rrHybridBounce">Hybrid Bounces <span id="rrHybridBounce-val">3</span></label>
+                                <input type="number" id="rrHybridBounce" min="2" max="5" step="1" value="3">
+                            </div>
+                            <div class="control-group">
+                                <label for="rrPoissonDensity">Pulse Density <span id="rrPoissonDensity-val">22.0</span></label>
+                                <input type="number" id="rrPoissonDensity" min="8" max="24" step="1" value="22">
+                            </div>
+                            <div class="control-group">
+                                <label for="rrDiffuseGain">Diffuse Gain <span id="rrDiffuseGain-val">1.60</span></label>
+                                <input type="number" id="rrDiffuseGain" min="0.8" max="2.0" step="0.1" value="1.6">
+                            </div>
+                            <div class="control-group">
+                                <label for="rrMinEnergy">Min Energy <span id="rrMinEnergy-val">1.0e-9</span></label>
+                                <input type="number" id="rrMinEnergy" min="1e-12" max="0.001" step="1e-9" value="1e-9">
+                            </div>
+                        </fieldset>
+                    </div>
+                </section>
+                <div class="panel-footer">
+                    <button id="resetButton" type="button" class="ghost">Reset Controls</button>
+                    <button id="startButton" class="cta">Simulate Acoustics</button>
+                </div>
+            </div>
+        </div>
+
+        <section id="auralizationPanel" class="panel-section is-open auralization-panel" data-section="auralization">
+            <div class="section-header">
+                <span>Controls</span>
+            </div>
+            <div class="section-body">
+                <div class="auralization-grid">
+                    <div class="auralization-card controls-column">
+                        <fieldset>
+                            <legend>Default Samples</legend>
+                            <label for="sample-audio">Select Sample <button id="uploadSampleBtn" type="button">Upload Sample</button></label>
+                            <div class="control-inline">
+                                <select name="sample-audio" id="sample-audio">
+                                    <option value="dog">Dog Bark (demo)</option>
+                                    <option value="synth">Synth Pad</option>
+                                    <option value="drum">Drum Hit</option>
+                                    <option value="vocal">Vocal Phrase</option>
+                                </select>
+                                <button id="playSampleBtn" type="button">Play</button>
+                                
+                            </div>
+                            <div class="control-group">
+                                <span>Dry Level</span>
+                                <output for="dry-slider" id="dry-output">0.0 dB</output>
+                                <input type="range" id="dry-slider" min="0" max="1000" step="1">
+                            </div>
+
+                            <div class="control-group">
+                                <span>Wet Level</span>
+                                <output for="wet-slider" id="wet-output">0.0 dB</output>
+                                <input type="range" id="wet-slider" min="0" max="1000" step="1">
+                            </div>
+                            <div class="control-group">
+                                <label for="samplePitch">Sample Pitch <span id="samplePitch-val">0 st</span></label>
+                                <input type="range" id="samplePitch" min="-12" max="12" step="1" value="0">
+                            </div>
+                        </fieldset>
+                    </div>
+                    <div class="auralization-card eq-column">
+                        <weq8-ui />
+                    </div>
+                            <div class="auralization-card waveform-column">
+                            <div class="control-group">
+                                <label for="irStretch">Stretch <span id="irStretch-val">1.00×</span></label>
+                                <input type="range" id="irStretch" min="0.1" max="10.0" step="0.05" value="1">
+                            </div>
+                            <div class="control-group">
+                                <label for="irPreDelay">Pre-Delay Trim <span id="irPreDelay-val">0 ms</span></label>
+                                <input type="range" id="irPreDelay" min="0" max="200" step="1" value="0">
+                            </div>
+                        <div id="waveform"></div>
+                        <button id="downloadBtn" type="button" disabled>Download IR (.wav)</button>
+                    </div>
+                </div>
+                <div class="auralization-status">
+                    <span>Console: </span>
+                    <p id="status" class="status-text">Simulate an IR to begin.</p>
+                </div>
+            </div>
+        </section>
+    </div>
+
+</body>
+</html>
