@@ -200,7 +200,7 @@ async function ensureRubberBandInstance() {
     return rubberBandInstancePromise;
 }
 
-async function processWithRubberBand(audioBuffer, { timeRatio = 1, pitchSemitones = 0 } = {}) {
+async function processWithRubberBand(audioBuffer, { timeRatio = 1, pitchSemitones = 0, formantSemitones = 0 } = {}) {
     if (!audioBuffer) throw new Error('No audio buffer provided to Rubber Band processor.');
     const rbApi = await ensureRubberBandInstance();
 
@@ -214,10 +214,12 @@ async function processWithRubberBand(audioBuffer, { timeRatio = 1, pitchSemitone
 
     const clampedRatio = Math.max(0.1, Math.min(timeRatio, 10.0));
     const pitchScale = Math.pow(2, pitchSemitones / 12);
+    const formantScale = Math.pow(2, formantSemitones / 12);
 
     const rbState = rbApi.rubberband_new(sampleRate, channels, RUBBERBAND_OPTIONS, 1, 1);
     rbApi.rubberband_set_time_ratio(rbState, clampedRatio);
     rbApi.rubberband_set_pitch_scale(rbState, pitchScale);
+    rbApi.rubberband_set_formant_scale(rbState, formantScale);
     rbApi.rubberband_set_expected_input_duration(rbState, inputLength);
 
     let samplesRequired = rbApi.rubberband_get_samples_required(rbState);
@@ -349,6 +351,8 @@ let irStretchTaskId = 0;
 let samplePitchTaskId = 0;
 let irStretchDebounce = null;
 let samplePitchDebounce = null;
+const customSampleRegistry = new Map();
+let customSampleIdCounter = 0;
 
 // Worker reference
 let workerInstance = null;
@@ -364,8 +368,9 @@ function cacheDom() {
         randomSeed: document.getElementById('randomSeed'),
         status: document.getElementById('status'),
         startButton: document.getElementById('startButton'),
-        downloadBtn: document.getElementById('downloadBtn'),
-        randomizeSeedBtn: document.getElementById('randomizeSeedBtn'),
+        uploadButton: document.getElementById('uploadSampleBtn'),
+        downloadButton: document.getElementById('downloadBtn'),
+        randomizeSeedButton: document.getElementById('randomizeSeedBtn'),
         raysToVisualizeSlider: document.getElementById('raysToVisualize'),
         lineColorModeSelect: document.getElementById('lineColorMode'),
         sampleAudioSelect: document.getElementById('sample-audio'),
@@ -377,6 +382,8 @@ function cacheDom() {
         wetOutput: document.getElementById('wet-output'),
         samplePitchSlider: document.getElementById('samplePitch'),
         samplePitchOutput: document.getElementById('samplePitch-val'),
+        sampleFormantSlider: document.getElementById('sampleFormant'),
+        sampleFormantOutput: document.getElementById('sampleFormant-val'),
         irStretchSlider: document.getElementById('irStretch'),
         irStretchOutput: document.getElementById('irStretch-val'),
         irPreDelaySlider: document.getElementById('irPreDelay'),
@@ -1289,34 +1296,67 @@ async function populateSampleDropdown() {
     }
 }
 
-async function loadSelectedSample(url) {
+async function loadSelectedSample(id) {
     stopSamplePlayback();
     sampleBuffer = null;
+    if (!id) return;
 
-    if (!url) return;
+    if (dom.playSampleBtn) dom.playSampleBtn.disabled = true;
 
+    // Uploaded (“custom:…”) samples come from memory instead of fetch()
+    if (id.startsWith('custom:')) {
+        const entry = customSampleRegistry.get(id);
+        if (!entry) {
+            setStatus('Uploaded sample not found.');
+            return;
+        }
+
+        const { arrayBuffer, name } = entry;
+        const bufferForDecode = arrayBuffer.slice(0); // keep original for reuse
+
+        try {
+            if (audioContext) {
+                sampleBuffer = await audioContext.decodeAudioData(bufferForDecode);
+                pitchedSampleBuffer = sampleBuffer;
+                scheduleSamplePitchUpdate(true, 'load');
+                setStatus(`Sample ready: ${name}`);
+                if (dom.playSampleBtn) dom.playSampleBtn.disabled = false;
+            } else {
+                window._pendingSampleBuffer = bufferForDecode;
+                window._pendingSampleName = name;
+                setStatus(`Sample loaded (awaiting audio context): ${name}`);
+            }
+        } catch (error) {
+            console.error('Uploaded sample decode failed:', error);
+            setStatus('Error decoding uploaded sample.');
+            customSampleRegistry.delete(id);
+            const option = dom.sampleAudioSelect?.querySelector(`option[value="${id}"]`);
+            if (option) option.remove();
+        }
+        return;
+    }
+
+    // Existing keyboard-sample logic
     if (!audioContext) {
         console.warn('AudioContext not initialized yet; sample will load but not play until splash is dismissed.');
     }
-    
+
     setStatus('Loading sample…');
-    if (dom.playSampleBtn) dom.playSampleBtn.disabled = true;
 
     try {
-        const response = await fetch(url);
+        const response = await fetch(id);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const arrayBuffer = await response.arrayBuffer();
-        
+
         if (audioContext) {
             sampleBuffer = await audioContext.decodeAudioData(arrayBuffer);
             pitchedSampleBuffer = sampleBuffer;
             scheduleSamplePitchUpdate(true, 'load');
-            setStatus(`Sample ready: ${url.split('/').pop()}`);
+            setStatus(`Sample ready: ${id.split('/').pop()}`);
             if (dom.playSampleBtn) dom.playSampleBtn.disabled = false;
         } else {
-            // Store for later decoding
             window._pendingSampleBuffer = arrayBuffer;
-            setStatus(`Sample loaded (awaiting audio context): ${url.split('/').pop()}`);
+            setStatus(`Sample loaded (awaiting audio context): ${id.split('/').pop()}`);
         }
     } catch (error) {
         console.error('Sample load failed:', error);
@@ -2219,6 +2259,48 @@ function setupEventListeners() {
         };
     });
     }
+
+    if (dom.uploadButton) {
+        dom.uploadButton.addEventListener('click', () => {
+            if (!dom.sampleAudioSelect) return;
+        
+            const fileInput = document.createElement('input');
+            fileInput.type = 'file';
+            fileInput.accept = 'audio/*';
+        
+            fileInput.addEventListener(
+                'change',
+                async (event) => {
+                    const file = event.target?.files?.[0];
+                    if (!file) return;
+                
+                    try {
+                        const arrayBuffer = await file.arrayBuffer();
+                        const id = `custom:${++customSampleIdCounter}`;
+                    
+                        customSampleRegistry.set(id, { arrayBuffer, name: file.name });
+                    
+                        const option = document.createElement('option');
+                        option.value = id;
+                        option.textContent = `Uploaded: ${file.name}`;
+                        option.dataset.origin = 'custom';
+                    
+                        dom.sampleAudioSelect.appendChild(option);
+                        dom.sampleAudioSelect.value = id;
+                    
+                        await loadSelectedSample(id);
+                    } catch (error) {
+                        console.error('Sample upload failed:', error);
+                        setStatus('Error reading uploaded file.');
+                    }
+                },
+                { once: true }
+            );
+        
+            fileInput.click();
+        });
+    }
+
 
     if (dom.stopSampleBtn) {
         dom.stopSampleBtn.addEventListener('click', () => stopSamplePlayback());
