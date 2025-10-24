@@ -9,7 +9,7 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/blobverb/assets/favicon-32x32-gakCKmq2.png">
     <link rel="icon" type="image/png" sizes="16x16" href="/blobverb/assets/favicon-16x16-C38QRaLz.png">
     <link rel="manifest" href="/blobverb/assets/site-DLKIwTBe.webmanifest">
-  <script type="module" crossorigin src="/blobverb/assets/index-nUkUkahL.js"></script>
+  <script type="module" crossorigin src="/blobverb/assets/index-CSdWY9Lu.js"></script>
   <link rel="stylesheet" crossorigin href="/blobverb/assets/index-Cp42pOce.css">
 </head>
 <body>
@@ -35,8 +35,8 @@
                     <div class="section-body">
                         <p>Uses physically based techniques to create reverb from 3D shapes, using ray-tracing to calculate the early reflections and ray-radiosity for the late reverberations of a impulse response, which is then convolved with the input audio.</p>
                         <p>Once the impulse response is synthesized you can audition it immediately with the built-in samples or upload your own dry audio, then download the IR for use in any convolution reverb.</p>
-                        <p>Under the hood: <strong>Three.js</strong> renders the scene, <strong>three-mesh-bvh</strong> accelerates ray intersections, <strong>WaveSurfer.js</strong> hosts the IR preview, <strong>WEQ8</strong> shapes the mix, and <strong>Rubber Band WASM</strong> drives the stretch/pitch tools.</p>
-                        <p>Designed and built by <a href="https://kyle-ramsey.com" target="_blank" rel="noopener">Kyle Ramsey</a>. Source code and latest updates live on <a href="https://github.com/kyle-ramsey/blobverb" target="_blank" rel="noopener">GitHub</a>.</p>
+                        <p>Uses <strong>Three.js</strong> renders the scene, <strong>three-mesh-bvh</strong> accelerates ray intersections, <strong>WaveSurfer.js</strong> hosts the IR preview, <strong>WEQ8</strong> shapes the mix, and <strong>Rubber Band WASM</strong> drives the stretch/pitch tools.</p>
+                        <p>Designed and built by <a href="https://trencrumb.github.io/" target="_blank" rel="noopener">Kyle Ramsey</a>. Source code and latest updates live on <a href="https://github.com/trencrumb/blobverb" target="_blank" rel="noopener">GitHub</a>.</p>
                     </div>
                 </section>
                 <section class="panel-section" data-section="instructions">
@@ -208,8 +208,12 @@
                                 <input type="range" id="wet-slider" min="0" max="1000" step="1">
                             </div>
                             <div class="control-group">
-                                <label for="samplePitch">Sample Pitch <span id="samplePitch-val">0 st</span></label>
+                                <label for="samplePitch">Pitch Shift <span id="samplePitch-val">0 st</span></label>
                                 <input type="range" id="samplePitch" min="-12" max="12" step="1" value="0">
+                            </div>
+                            <div class="control-group">
+                                <label for="sampleFormant">Formant Shift <span id="sampleFormant-val">0 st</span></label>
+                                <input type="range" id="sampleFormant" min="-12" max="12" step="1" value="0">
                             </div>
                         </fieldset>
                     </div>
